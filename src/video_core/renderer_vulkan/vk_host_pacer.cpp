@@ -31,7 +31,19 @@ std::optional<double> QueryRefreshPeriodNs() {
     info.cbSize = sizeof(info);
     if (SUCCEEDED(DwmGetCompositionTimingInfo(nullptr, &info)) &&
         info.rateRefresh.uiNumerator != 0 && info.rateRefresh.uiDenominator != 0) {
-        return 1e9 * info.rateRefresh.uiDenominator / info.rateRefresh.uiNumerator;
+        const double nominal = 1e9 * info.rateRefresh.uiDenominator / info.rateRefresh.uiNumerator;
+        // The compositor's measured period: a "120 Hz" display may run at 119.98, and the game's
+        // frame clock follows this (genlock). The nominal rate when it looks off.
+        LARGE_INTEGER frequency{};
+        if (info.qpcRefreshPeriod != 0 && QueryPerformanceFrequency(&frequency) &&
+            frequency.QuadPart != 0) {
+            const double measured = 1e9 * static_cast<double>(info.qpcRefreshPeriod) /
+                                    static_cast<double>(frequency.QuadPart);
+            if (std::abs(measured - nominal) < nominal * 0.01) {
+                return measured;
+            }
+        }
+        return nominal;
     }
     DEVMODEW mode{};
     mode.dmSize = sizeof(mode);
@@ -58,13 +70,11 @@ void HostPacer::Refresh(Clock::time_point now, bool allowed) {
     if (now >= next_refresh_query) {
         next_refresh_query = now + std::chrono::seconds{2};
         if (const auto period = QueryRefreshPeriodNs(); period && *period > 2e6 && *period < 50e6) {
-            if (!refresh_known || std::abs(*period - nominal_refresh_ns) > nominal_refresh_ns * 0.01) {
-                LOG_INFO(Render_Vulkan, "Host pacing: display refresh {:.3f} Hz", 1e9 / *period);
+            if (!refresh_known || std::abs(*period - refresh_ns) > refresh_ns * 0.01) {
+                LOG_INFO(Render_Vulkan, "Host pacing: display refresh {:.4f} Hz", 1e9 / *period);
                 vblank.reset();
-                anchor.reset();
-                refresh_ns = *period;
             }
-            nominal_refresh_ns = *period;
+            refresh_ns = *period;
             refresh_known = true;
         }
     }
@@ -167,34 +177,11 @@ void HostPacer::NoteShown(u64 id, Clock::time_point shown, bool was_lost) {
         if (refreshes >= 1) {
             const auto predicted = *vblank + ToNs(static_cast<double>(refreshes) * refresh_ns);
             const double residual = static_cast<double>(Ns{shown - predicted}.count());
-            if (std::abs(residual) < refresh_ns * 0.5) {
-                vblank = predicted + ToNs(residual * 0.1);
-                anchor_refreshes += static_cast<u64>(refreshes);
-            } else {
-                vblank = shown;
-                anchor.reset();
-            }
+            vblank = std::abs(residual) < refresh_ns * 0.5 ? predicted + ToNs(residual * 0.1)
+                                                            : shown;
         }
     } else {
         vblank = shown;
-        anchor.reset();
-    }
-    // Measure the display's real refresh period over the refreshes counted since an anchor (a
-    // "120 Hz" display can run at 119.98): the game's frame clock follows it (genlock), so its
-    // frames don't drift out of their refresh slots once a minute.
-    if (!anchor) {
-        anchor = vblank;
-        anchor_refreshes = 0;
-    } else if (anchor_refreshes >= 1200) {
-        const double measured =
-            static_cast<double>(Ns{*vblank - *anchor}.count()) / static_cast<double>(anchor_refreshes);
-        if (std::abs(measured - nominal_refresh_ns) < nominal_refresh_ns * 0.005) {
-            refresh_ns = measured;
-        }
-        if (anchor_refreshes >= 12000) {
-            anchor = vblank;
-            anchor_refreshes = 0;
-        }
     }
     if (entry && entry->intended) {
         if (shown > *entry->intended + ToNs(refresh_ns * 0.5)) {
@@ -223,7 +210,7 @@ void HostPacer::Report(Clock::time_point now) {
         intervals += count;
     }
     LOG_INFO(Render_Vulkan,
-             "Host pacing {}: {} frames at {:.2f} Hz; shown for 1/2/3/4/5+ refreshes: "
+             "Host pacing {}: {} frames at {:.3f} Hz; shown for 1/2/3/4/5+ refreshes: "
              "{}/{}/{}/{}/{} (same refresh {}); interval mean {:.2f} ms, max {:.2f}; held {} "
              "(mean {:.2f} ms, missed {}), lead {:.2f} ms; present to shown {:.2f} ms; game "
              "frame {:.2f} ms; {} lost; caught up {}",
