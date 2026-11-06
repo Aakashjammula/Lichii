@@ -106,6 +106,7 @@ add_executable(tests
     common/container_hash.cpp
     common/core_pinning.cpp
     common/event.cpp
+    common/thread_placement.cpp
     common/fibers.cpp
     common/fs_iterate.cpp
     common/game_presets.cpp

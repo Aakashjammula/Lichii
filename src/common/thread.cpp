@@ -87,6 +87,86 @@ int NiceValueForPriority(Common::ThreadPriority priority) {
 } // Anonymous namespace
 #endif
 
+#if defined(__linux__) && !defined(__ANDROID__)
+#include <cstdlib>
+#include <fstream>
+
+namespace {
+// EDEN_NX2_LINUX_THREAD_PLACEMENT=1: on hybrid Intel CPUs keep time-critical threads on the P-cores
+// and background workers on the E-cores (the Linux side of zortos293/Lichii PR #232); background
+// workers also run as SCHED_BATCH so they do not preempt guest and GPU threads on wakeup.
+struct LinuxPlacement {
+    cpu_set_t allowed{};
+    cpu_set_t performance{};
+    cpu_set_t efficiency{};
+    bool enabled = false;
+    bool hybrid = false;
+};
+
+bool ReadCpuSet(const char* path, const cpu_set_t& allowed, cpu_set_t& out) {
+    std::ifstream file(path);
+    std::string list;
+    if (!file || !std::getline(file, list)) {
+        return false;
+    }
+    CPU_ZERO(&out);
+    for (const u32 cpu : Common::ParseCpuList(list)) {
+        if (cpu < CPU_SETSIZE && CPU_ISSET(cpu, &allowed)) {
+            CPU_SET(cpu, &out);
+        }
+    }
+    return CPU_COUNT(&out) > 0;
+}
+
+const LinuxPlacement& Placement() {
+    static const LinuxPlacement placement = [] {
+        LinuxPlacement result;
+        const char* value = std::getenv("EDEN_NX2_LINUX_THREAD_PLACEMENT");
+        result.enabled = value && value[0] == '1';
+        if (!result.enabled) {
+            return result;
+        }
+        // The main thread is never placed, so its mask is the process mask.
+        if (sched_getaffinity(getpid(), sizeof(result.allowed), &result.allowed) != 0) {
+            result.enabled = false;
+            return result;
+        }
+        result.hybrid =
+            ReadCpuSet("/sys/devices/cpu_core/cpus", result.allowed, result.performance) &&
+            ReadCpuSet("/sys/devices/cpu_atom/cpus", result.allowed, result.efficiency);
+        LOG_INFO(Common, "Linux thread placement: {} P-cores, {} E-cores{}",
+                 CPU_COUNT(&result.performance), CPU_COUNT(&result.efficiency),
+                 result.hybrid ? "" : " (not hybrid, affinity unchanged)");
+        return result;
+    }();
+    return placement;
+}
+
+void SetLinuxAffinity(const cpu_set_t& mask) {
+    if (gettid() == getpid()) {
+        return;
+    }
+    if (sched_setaffinity(0, sizeof(mask), &mask) != 0) {
+        LOG_WARNING(Common, "Could not set thread affinity: {}", Common::GetLastErrorMsg());
+    }
+}
+
+void PlaceLinuxBackgroundThread() {
+    const LinuxPlacement& placement = Placement();
+    if (!placement.enabled) {
+        return;
+    }
+    sched_param param{};
+    if (pthread_setschedparam(pthread_self(), SCHED_BATCH, &param) != 0) {
+        LOG_DEBUG(Common, "Could not set SCHED_BATCH");
+    }
+    if (placement.hybrid) {
+        SetLinuxAffinity(placement.efficiency);
+    }
+}
+} // Anonymous namespace
+#endif
+
 #ifdef __ANDROID__
 #include <sys/utsname.h>
 #include <atomic>
@@ -540,6 +620,51 @@ void SelectCurrentThreadCpuSets(const std::vector<ULONG>& ids) {
 
 namespace Common {
 
+std::vector<u32> ParseCpuList(std::string_view list) {
+    std::vector<u32> cpus;
+    while (!list.empty() && (list.back() == '\n' || list.back() == ' ')) {
+        list.remove_suffix(1);
+    }
+    const auto parse_number = [&list](u32& out) {
+        size_t length = 0;
+        u32 value = 0;
+        while (length < list.size() && list[length] >= '0' && list[length] <= '9' &&
+               length < 5) {
+            value = value * 10 + static_cast<u32>(list[length] - '0');
+            ++length;
+        }
+        list.remove_prefix(length);
+        out = value;
+        return length > 0;
+    };
+    while (!list.empty()) {
+        u32 first = 0;
+        if (!parse_number(first)) {
+            return {};
+        }
+        u32 last = first;
+        if (!list.empty() && list.front() == '-') {
+            list.remove_prefix(1);
+            if (!parse_number(last) || last < first) {
+                return {};
+            }
+        }
+        for (u32 cpu = first; cpu <= last; ++cpu) {
+            cpus.push_back(cpu);
+        }
+        if (!list.empty()) {
+            if (list.front() != ',') {
+                return {};
+            }
+            list.remove_prefix(1);
+            if (list.empty()) {
+                return {};
+            }
+        }
+    }
+    return cpus;
+}
+
 void SetCurrentThreadPriority(ThreadPriority new_priority) {
 #ifdef _WIN32
     int windows_priority = [&]() {
@@ -639,6 +764,10 @@ void SetCurrentThreadToPerformanceCores() {
     if (const WindowsCpuSets& sets = CpuSets(); sets.hybrid) {
         SelectCurrentThreadCpuSets(sets.performance);
     }
+#elif defined(__linux__)
+    if (const LinuxPlacement& placement = Placement(); placement.hybrid) {
+        SetLinuxAffinity(placement.performance);
+    }
 #endif
 }
 
@@ -691,6 +820,8 @@ void SetCurrentThreadToEfficiencyCores() {
     if (const WindowsCpuSets& sets = CpuSets(); sets.hybrid) {
         SelectCurrentThreadCpuSets(sets.efficiency);
     }
+#elif defined(__linux__)
+    PlaceLinuxBackgroundThread();
 #endif
 }
 
@@ -702,6 +833,8 @@ void SetCurrentThreadToBackgroundWork() {
     if (const WindowsCpuSets& sets = CpuSets(); sets.hybrid) {
         SelectCurrentThreadCpuSets({});
     }
+#elif defined(__linux__)
+    PlaceLinuxBackgroundThread();
 #endif
 }
 
@@ -712,6 +845,11 @@ void SetCurrentThreadToAllCores() {
 #elif defined(_WIN32)
     if (const WindowsCpuSets& sets = CpuSets(); sets.hybrid) {
         SelectCurrentThreadCpuSets({});
+    }
+#elif defined(__linux__)
+    // Undo a mask inherited from a placed parent thread.
+    if (const LinuxPlacement& placement = Placement(); placement.hybrid) {
+        SetLinuxAffinity(placement.allowed);
     }
 #endif
 }

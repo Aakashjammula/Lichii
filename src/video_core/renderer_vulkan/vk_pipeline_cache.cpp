@@ -395,6 +395,13 @@ size_t GetTotalPipelineWorkers() {
     }
     return std::min(max_core_threads, desired);
 #else
+    // EDEN_NX2_PIPELINE_WORKERS=<n> caps the pipeline builder threads.
+    if (const char* value = std::getenv("EDEN_NX2_PIPELINE_WORKERS")) {
+        const long requested = std::strtol(value, nullptr, 10);
+        if (requested > 0) {
+            return std::min(max_core_threads, static_cast<size_t>(requested));
+        }
+    }
     return max_core_threads;
 #endif
 }
