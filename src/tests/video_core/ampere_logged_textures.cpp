@@ -22,6 +22,19 @@ namespace {
 namespace IR = Shader::IR;
 using Shader::Ampere::Instruction;
 constexpr Instruction Exit{{0x794d, 0, 0x03800000, 0}};
+
+// Unproven per-tap offsets are copied from Rb, Rb+1 into R248, R249 instead of rejected.
+[[maybe_unused]] bool UsesRuntimeOffsets(const Shader::Ampere::LoweredProgram& lowered) {
+    if (!lowered) return false;
+    bool low = false, high = false;
+    for (const u64 word : lowered.instructions) {
+        if ((word >> 48) != 0x5c98) continue;
+        low |= (word & 255) == 248;
+        high |= (word & 255) == 249;
+    }
+    return low && high;
+}
+
 constexpr Instruction Fetch{{0x02017b66, 0x33c04401, 0x059e8705, 0x00114400}};
 constexpr std::array<Instruction, 2> Gathers{{
     {{0x06027b63, 0x33c04407, 0x041e8f03, 0x000fc200}},
@@ -461,7 +474,8 @@ TEST_CASE("Ampere half per-tap gathers round and pack each pair in low-high orde
 
 TEST_CASE("Logged half textures retain unsupported-mode rejections",
           "[video_core][ampere][logged_textures]") {
-    for (const u32 bit : {76U, 77U, 78U, 80U, 91U}) {
+    // Bit 77 alone makes a per-tap half gather, which lowers with runtime offsets.
+    for (const u32 bit : {76U, 78U, 80U, 91U}) {
         auto invalid{Gathers[0]};
         invalid.words[bit / 32] ^= 1U << (bit % 32);
         CHECK_FALSE(Shader::Ampere::LowerToMaxwell(std::array{invalid, Exit}));
@@ -614,8 +628,7 @@ TEST_CASE("Half per-tap gathers prove offsets across an unrelated LEA.HI",
     INFO(lowered.error);
     REQUIRE(lowered);
     code[2].words[0] = 0x08017211;
-    CHECK(Shader::Ampere::LowerToMaxwell(code).error ==
-          "native per-tap gather nonconstant offsets");
+    CHECK(UsesRuntimeOffsets(Shader::Ampere::LowerToMaxwell(code)));
 }
 
 TEST_CASE("Per-tap gathers with runtime offsets gather each tap at its own offset",

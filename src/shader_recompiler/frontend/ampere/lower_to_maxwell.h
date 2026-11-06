@@ -2505,7 +2505,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             // for TEX); Maxwell TLD4 takes it as AOFFI (bits 54-55) from Rb.
             const bool offsets = insn.Bits(76, 1) != 0;
             // Bits 76-77 = 2: per-tap offsets (PTP), x and y in Ra, Ra+1 and the packed offsets in
-            // Rb, Rb+1. The host gather needs them as constants, so they must be proven immediates.
+            // Rb, Rb+1.
             const bool per_tap = insn.Bits(76, 2) == 2;
             const bool depth = insn.Bits(78, 1) != 0;
             const bool half = insn.Bits(79, 1) != 0;
@@ -2555,103 +2555,113 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                     source_b + 1 >= register_limit || (dest != 255 && dest + 1 >= register_limit) ||
                     (second_dest != 255 && second_dest + 1 >= register_limit))
                     return fail(index, "native per-tap gather operands");
-                std::array<std::optional<u32>, 2> packed_offsets;
-                bool imad_offsets = false;
-                bool predicate_clobbered = false;
-                if (!bounded_control)
-                    return fail(index, "native per-tap gather control-flow proof");
-                for (u32 cursor = index; cursor > 0 && (!packed_offsets[0] || !packed_offsets[1]);) {
-                    if (control_entries[cursor])
-                        return fail(index, "native per-tap gather control-flow proof");
-                    const auto& definition = code[--cursor];
-                    if (definition.Bits(12, 4) == 15) continue;
-                    const u32 op = definition.Bits(0, 12), target = definition.Bits(16, 8);
-                    u32 written_predicates = ~0U;
-                    switch (op) {
-                    case 0x802: case 0x805: case 0x819: case 0x823: case 0x91a:
-                    case 0x945: case 0x947:
-                        written_predicates = 0;
-                        break;
-                    case 0x212: case 0x812: case 0x224: case 0x424: case 0x624:
-                    case 0x824: case 0xb63:
-                        written_predicates = 1U << definition.Bits(81, 3);
-                        break;
-                    case 0x810: case 0x81c:
-                        written_predicates = (1U << definition.Bits(81, 3)) |
-                                             (1U << definition.Bits(84, 3));
-                        break;
-                    }
-                    predicate_clobbered |= (written_predicates & (1U << (native_predicate & 7))) != 0;
-                    if (op == 0xb63) {
-                        const u32 count = static_cast<u32>(std::popcount(definition.Bits(72, 4)));
-                        const u32 high = definition.Bits(64, 8);
-                        const bool packed = definition.Bits(79, 1);
-                        const u32 first_count = packed ? (high == 255 ? (count + 1) / 2 : 1U) : high == 255 ? count : std::min(count, 2U);
-                        const u32 second_count = packed ? (count > 2 ? 1U : 0U) : count > 2 ? count - 2 : 0U;
-                        for (u32 i = 0; i < 2; ++i) {
-                            if (packed_offsets[i]) continue;
-                            const u32 reg = source_b + i;
-                            if ((target != 255 && reg >= target && reg < target + first_count) ||
-                                (high != 255 && reg >= high && reg < high + second_count))
-                                return fail(index, "native per-tap gather offset clobber");
-                        }
-                        continue;
-                    }
-                    auto count = write_count(definition);
-                    switch (op) {
-                    case 0x827: case 0x307: case 0x211: case 0x811: case 0xa11: case 0x624: case 0x831:
-                    case 0x832: case 0x224:
-                        count = 1;
-                        break;
-                    case 0x805:
-                        count = 2;
-                        break;
-                    case 0x945: case 0x947: case 0x91a:
-                        count = 0;
-                        break;
-                    }
-                    if (!count) return fail(index, "native per-tap gather offset proof");
-                    for (u32 i = 0; i < 2; ++i) {
-                        if (packed_offsets[i] || target == 255 || source_b + i < target || source_b + i >= target + *count)
-                            continue;
-                        const bool move = op == 0x802 && !definition.Bits(24, 8) && definition.words[2] == 0xf00;
-                        const bool imad = op == 0x424 && definition.Bits(24, 8) == 255 && definition.words[2] == 0x078e00ff;
-                        const bool same_guard = imad && definition.Bits(12, 4) == native_predicate &&
-                                                !predicate_clobbered;
-                        if ((!move && !imad) || (definition.Bits(12, 4) != 7 && !same_guard) ||
-                            (definition.words[3] & 0xc00001ffU))
-                            return fail(index, "native per-tap gather nonconstant offsets");
-                        imad_offsets |= imad;
-                        packed_offsets[i] = definition.words[1];
-                    }
-                }
-                if (!half && !imad_offsets) {
-                    bool terminal = false;
-                    for (const auto& instruction : code) {
-                        if (instruction.Bits(12, 4) == 15) continue;
-                        const u32 op = instruction.Bits(0, 12);
-                        if (op == 0x94d && instruction.Bits(12, 4) == 7) {
-                            terminal = true;
+                // Offsets the scan proves constant are passed as immediates; otherwise Rb, Rb+1 are
+                // copied and the backend gathers each tap with its own runtime offset.
+                const auto proven = [&]() -> std::optional<std::array<u32, 2>> {
+                    std::array<std::optional<u32>, 2> packed_offsets;
+                    bool imad_offsets = false;
+                    bool predicate_clobbered = false;
+                    if (!bounded_control)
+                        return std::nullopt;
+                    for (u32 cursor = index; cursor > 0 && (!packed_offsets[0] || !packed_offsets[1]);) {
+                        if (control_entries[cursor])
+                            return std::nullopt;
+                        const auto& definition = code[--cursor];
+                        if (definition.Bits(12, 4) == 15) continue;
+                        const u32 op = definition.Bits(0, 12), target = definition.Bits(16, 8);
+                        u32 written_predicates = ~0U;
+                        switch (op) {
+                        case 0x802: case 0x805: case 0x819: case 0x823: case 0x91a:
+                        case 0x945: case 0x947:
+                            written_predicates = 0;
+                            break;
+                        case 0x212: case 0x812: case 0x224: case 0x424: case 0x624:
+                        case 0x824: case 0xb63:
+                            written_predicates = 1U << definition.Bits(81, 3);
+                            break;
+                        case 0x810: case 0x81c:
+                            written_predicates = (1U << definition.Bits(81, 3)) |
+                                                 (1U << definition.Bits(84, 3));
                             break;
                         }
-                        if (op != 0x326 && op != 0x802 && op != 0x307 && op != 0x421 &&
-                            op != 0xa20 && op != 0xb63 && op != 0x221 && op != 0x823 &&
-                            op != 0x423 && op != 0x223 && op != 0x308 && op != 0x220 && op != 0x820)
-                            return fail(index, "native per-tap gather control-flow proof");
+                        predicate_clobbered |= (written_predicates & (1U << (native_predicate & 7))) != 0;
+                        if (op == 0xb63) {
+                            const u32 count = static_cast<u32>(std::popcount(definition.Bits(72, 4)));
+                            const u32 high = definition.Bits(64, 8);
+                            const bool packed = definition.Bits(79, 1);
+                            const u32 first_count = packed ? (high == 255 ? (count + 1) / 2 : 1U) : high == 255 ? count : std::min(count, 2U);
+                            const u32 second_count = packed ? (count > 2 ? 1U : 0U) : count > 2 ? count - 2 : 0U;
+                            for (u32 i = 0; i < 2; ++i) {
+                                if (packed_offsets[i]) continue;
+                                const u32 reg = source_b + i;
+                                if ((target != 255 && reg >= target && reg < target + first_count) ||
+                                    (high != 255 && reg >= high && reg < high + second_count))
+                                    return std::nullopt;
+                            }
+                            continue;
+                        }
+                        auto count = write_count(definition);
+                        switch (op) {
+                        case 0x827: case 0x307: case 0x211: case 0x811: case 0xa11: case 0x624: case 0x831:
+                        case 0x832: case 0x224:
+                            count = 1;
+                            break;
+                        case 0x805:
+                            count = 2;
+                            break;
+                        case 0x945: case 0x947: case 0x91a:
+                            count = 0;
+                            break;
+                        }
+                        if (!count) return std::nullopt;
+                        for (u32 i = 0; i < 2; ++i) {
+                            if (packed_offsets[i] || target == 255 || source_b + i < target || source_b + i >= target + *count)
+                                continue;
+                            const bool move = op == 0x802 && !definition.Bits(24, 8) && definition.words[2] == 0xf00;
+                            const bool imad = op == 0x424 && definition.Bits(24, 8) == 255 && definition.words[2] == 0x078e00ff;
+                            const bool same_guard = imad && definition.Bits(12, 4) == native_predicate &&
+                                                    !predicate_clobbered;
+                            if ((!move && !imad) || (definition.Bits(12, 4) != 7 && !same_guard) ||
+                                (definition.words[3] & 0xc00001ffU))
+                                return std::nullopt;
+                            imad_offsets |= imad;
+                            packed_offsets[i] = definition.words[1];
+                        }
                     }
-                    if (!terminal) return fail(index, "native per-tap gather terminal proof");
-                }
-                for (const auto& packed : packed_offsets) {
-                    if (!packed) return fail(index, "native per-tap gather missing offsets");
-                    // Each byte is a signed 6-bit offset; the gather reads only the low six bits.
-                    for (u32 shift = 0; shift < 32; shift += 8) {
-                        const u32 value = (*packed >> shift) & 255;
-                        if (value > 31 && value < 224)
-                            return fail(index, "native per-tap gather offset range");
+                    if (!half && !imad_offsets) {
+                        bool terminal = false;
+                        for (const auto& instruction : code) {
+                            if (instruction.Bits(12, 4) == 15) continue;
+                            const u32 op = instruction.Bits(0, 12);
+                            if (op == 0x94d && instruction.Bits(12, 4) == 7) {
+                                terminal = true;
+                                break;
+                            }
+                            if (op != 0x326 && op != 0x802 && op != 0x307 && op != 0x421 &&
+                                op != 0xa20 && op != 0xb63 && op != 0x221 && op != 0x823 &&
+                                op != 0x423 && op != 0x223 && op != 0x308 && op != 0x220 && op != 0x820)
+                                return std::nullopt;
+                        }
+                        if (!terminal) return std::nullopt;
                     }
+                    for (const auto& packed : packed_offsets) {
+                        if (!packed) return std::nullopt;
+                        // Each byte is a signed 6-bit offset; the gather reads only the low six bits.
+                        for (u32 shift = 0; shift < 32; shift += 8) {
+                            const u32 value = (*packed >> shift) & 255;
+                            if (value > 31 && value < 224)
+                                return std::nullopt;
+                        }
+                    }
+                    return std::array<u32, 2>{*packed_offsets[0], *packed_offsets[1]};
+                }();
+                for (u32 i = 0; i < 2; ++i) {
+                    if (proven)
+                        emit(0x010000000007f000ULL | (248 + i) | (u64{(*proven)[i]} << 20));
+                    else
+                        emit(0x5c98000000000000ULL | predicate | (248 + i) | (u64{15} << 39) |
+                             (u64{source_b + i} << 20));
                 }
-                for (u32 i = 0; i < packed_offsets.size(); ++i)
-                    emit(0x010000000007f000ULL | (248 + i) | (u64{*packed_offsets[i]} << 20));
             }
             // Two coordinates: x in Ra, y in Rb (the coordinate list splits evenly across them);
             // with an offset, x and y in Ra, Ra+1 and the offset in Rb.
