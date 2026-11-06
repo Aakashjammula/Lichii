@@ -24,7 +24,7 @@ void Scheduler::BindChannel(GPU& gpu, s32 bind_id) {
         split.Defer([this, gpu_ptr = &gpu, bind_id] {
             std::scoped_lock lk{scheduling_guard};
             gpu_ptr->BindChannel(bind_id);
-        });
+        }, false);
         return;
     }
     std::scoped_lock lk{scheduling_guard};

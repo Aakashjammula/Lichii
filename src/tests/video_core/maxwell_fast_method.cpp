@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <memory>
@@ -815,4 +816,140 @@ TEST_CASE("Maxwell3D keeps state written after the split stops over the front's 
     engine.CallMethod(f.system, MAXWELL3D_REG_INDEX(load_mme.start_address_ptr), 0, true);
     CHECK(engine.shadow_state.reg_array[state] == 0x5678);
     CHECK(engine.regs.reg_array[state] == 0x5678);
+}
+
+TEST_CASE("EDEN_NX2_FAST_DRAIN is off by default", "[video_core][gpu_split_fast_drain]") {
+    if (std::getenv("EDEN_NX2_FAST_DRAIN") != nullptr) {
+        SKIP("EDEN_NX2_FAST_DRAIN is set in the environment");
+    }
+    REQUIRE_FALSE(VideoCommon::GpuSplit::FastDrain());
+}
+
+TEST_CASE("Fast-drain macro reads wait for overlapping, aliased and unranged writers only",
+          "[video_core][gpu_split_fast_drain]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    Fixture f;
+    f.system.Initialize();
+    Kernel::KProcess process{f.system.Kernel()};
+    SCOPE_EXIT { f.system.Kernel().UnregisterKernelObject(&process); };
+    auto& table = process.GetPageTable().GetImpl();
+    table.Resize(20, 12);
+    constexpr VAddr cpu_address = 0x4000;
+    constexpr DAddr device_address = 0x10000;
+    constexpr GPUVAddr gpu_address = 0x100000;
+    constexpr GPUVAddr alias = 0x200000;
+    auto* backing = f.physical.GetPointerFromRaw<u8>(0x10000);
+    for (u64 page = 0; page < 2; ++page) {
+        const VAddr address = cpu_address + page * 0x1000;
+        table.entries.GetAndFault(address >> 12)
+            .Store(false, Common::PageType::Memory, 1,
+                   reinterpret_cast<uintptr_t>(backing + page * 0x1000) - address);
+    }
+    process.GetMemory().SetCurrentPageTable(process);
+    const auto asid = f.device_memory.RegisterProcess(&process.GetMemory());
+    f.device_memory.BindInterface(&f.rasterizer);
+    f.device_memory.Map(device_address, cpu_address, 0x2000, asid);
+    SCOPE_EXIT {
+        f.device_memory.Unmap(device_address, 0x2000);
+        f.device_memory.UnregisterProcess(asid);
+    };
+    f.memory.BindRasterizer(&f.rasterizer);
+    f.memory.Map(gpu_address, device_address, 0x2000, Tegra::PTEKind::PITCH, false);
+    f.memory.Map(alias, device_address, 0x1000, Tegra::PTEKind::PITCH, false);
+
+    // No back thread: everything sent stays queued.
+    VideoCommon::GpuSplit split;
+    Access::Initialize(split, f.system);
+    const auto queued = [&](GPUVAddr address, u64 size) {
+        return split.HasQueuedMemoryWriters(f.memory, address, address + size);
+    };
+    REQUIRE_FALSE(queued(gpu_address, 4));
+
+    // Neither a draw nor work deferred as not writing memory counts.
+    split.Method(&f.fast, DrawEnd, 0, true, nullptr);
+    split.Defer([] {}, false);
+    REQUIRE_FALSE(queued(gpu_address, 4));
+
+    const std::array<u32, 4> words{1, 2, 3, 4};
+    split.MultiMethod(&f.fast, CbData, words.data(), 4, 4, nullptr);
+    split.RangeLastWrite(f.memory, gpu_address, gpu_address + 16, words.data());
+    REQUIRE(queued(gpu_address + 8, 4));
+    REQUIRE(queued(alias + 12, 8)); // The same device words through another mapping
+    REQUIRE_FALSE(queued(gpu_address + 16, 4));
+    REQUIRE_FALSE(queued(gpu_address + 0x1000, 4));
+
+    // Covered by the newest upload in the same address space: served from it.
+    std::array<u32, 2> forwarded{};
+    REQUIRE(split.ForwardRead(f.memory, gpu_address + 4, 2, forwarded.data()));
+    REQUIRE(forwarded == std::array<u32, 2>{2, 3});
+    REQUIRE_FALSE(split.ForwardRead(f.memory, alias + 4, 2, forwarded.data()));
+    REQUIRE_FALSE(split.ForwardRead(f.memory, gpu_address + 12, 2, forwarded.data()));
+    REQUIRE_FALSE(split.ForwardRead(f.memory, gpu_address + 0x1000, 1, forwarded.data()));
+
+    // Deferred work that may write memory (here a puller release) counts for every read.
+    REQUIRE_FALSE(queued(gpu_address + 0x1800, 4));
+    split.Defer([] {});
+    REQUIRE(queued(gpu_address + 0x1800, 4));
+    REQUIRE_FALSE(split.ForwardRead(f.memory, gpu_address + 4, 2, forwarded.data()));
+
+    // A release meets acquires of its word until something after it may write the word.
+    split.NoteRelease(device_address + 0x1000, 7);
+    u32 miss{};
+    REQUIRE(split.QueuedReleasePayload(f.memory, gpu_address + 0x1000, &miss) == 7u);
+    REQUIRE_FALSE(split.QueuedReleasePayload(f.memory, gpu_address + 0x1004, &miss));
+    REQUIRE(miss == 1);
+    const std::array<u32, 1> other{9};
+    split.MultiMethod(&f.fast, CbData, other.data(), 1, 1, nullptr);
+    split.RangeLastWrite(f.memory, gpu_address + 0x800, gpu_address + 0x804, other.data());
+    REQUIRE(split.QueuedReleasePayload(f.memory, gpu_address + 0x1000) == 7u);
+    split.MultiMethod(&f.fast, CbData, other.data(), 1, 1, nullptr);
+    split.RangeLastWrite(f.memory, gpu_address + 0x1000, gpu_address + 0x1004, other.data());
+    REQUIRE_FALSE(split.QueuedReleasePayload(f.memory, gpu_address + 0x1000, &miss));
+    REQUIRE(miss == 3);
+}
+
+TEST_CASE("Fast-drain forwarding stops at unranged writes between merged uploads",
+          "[video_core][gpu_split_fast_drain]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    Fixture f;
+    f.system.Initialize();
+    Kernel::KProcess process{f.system.Kernel()};
+    SCOPE_EXIT { f.system.Kernel().UnregisterKernelObject(&process); };
+    auto& table = process.GetPageTable().GetImpl();
+    table.Resize(20, 12);
+    constexpr VAddr cpu_address = 0x4000;
+    constexpr DAddr device_address = 0x10000;
+    constexpr GPUVAddr gpu_address = 0x100000;
+    auto* backing = f.physical.GetPointerFromRaw<u8>(0x10000);
+    table.entries.GetAndFault(cpu_address >> 12)
+        .Store(false, Common::PageType::Memory, 1,
+               reinterpret_cast<uintptr_t>(backing) - cpu_address);
+    process.GetMemory().SetCurrentPageTable(process);
+    const auto asid = f.device_memory.RegisterProcess(&process.GetMemory());
+    f.device_memory.BindInterface(&f.rasterizer);
+    f.device_memory.Map(device_address, cpu_address, 0x1000, asid);
+    SCOPE_EXIT {
+        f.device_memory.Unmap(device_address, 0x1000);
+        f.device_memory.UnregisterProcess(asid);
+    };
+    f.memory.BindRasterizer(&f.rasterizer);
+    f.memory.Map(gpu_address, device_address, 0x1000, Tegra::PTEKind::PITCH, false);
+
+    VideoCommon::GpuSplit split;
+    Access::Initialize(split, f.system);
+    const std::array<u32, 2> first{1, 2};
+    const std::array<u32, 2> second{3, 4};
+    std::array<u32, 4> forwarded{};
+    split.MultiMethod(&f.fast, CbData, first.data(), 2, 2, nullptr);
+    split.RangeLastWrite(f.memory, gpu_address, gpu_address + 8, first.data());
+    split.MultiMethod(&f.fast, CbData, second.data(), 2, 2, nullptr);
+    split.RangeLastWrite(f.memory, gpu_address + 8, gpu_address + 16, second.data());
+    REQUIRE(split.ForwardRead(f.memory, gpu_address, 4, forwarded.data()));
+    REQUIRE(forwarded == std::array<u32, 4>{1, 2, 3, 4});
+
+    split.Defer([] {}); // May overwrite the uploaded words
+    split.MultiMethod(&f.fast, CbData, first.data(), 2, 2, nullptr);
+    split.RangeLastWrite(f.memory, gpu_address + 16, gpu_address + 24, first.data());
+    REQUIRE_FALSE(split.ForwardRead(f.memory, gpu_address, 2, forwarded.data()));
+    REQUIRE(split.HasQueuedMemoryWriters(f.memory, gpu_address, gpu_address + 8));
 }

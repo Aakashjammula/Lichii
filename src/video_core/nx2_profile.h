@@ -100,10 +100,36 @@ inline u64 Ticks() {
 #endif
 }
 
+/// What a front macro memory read (MME DMA) had to wait for with EDEN_NX2_FAST_DRAIN: the
+/// newest queued writer it depends on.
+enum class DmaWaitCause : u32 {
+    ComputeCopy,       ///< Compute or copy work
+    HostSync,          ///< The work before a host-level wait
+    ConstBufferUpload, ///< A 3D constant buffer upload (const_buffer.buffer)
+    InlineUpload,      ///< 3D inline data
+    Macro3D,           ///< A 3D macro register
+    Report,            ///< A 3D report (report_semaphore.query)
+    DmaLaunch,         ///< 3D launch_dma
+    SyncInfo,          ///< 3D sync_info
+    WaitForIdle,       ///< 3D wait_for_idle
+    Other3D,           ///< Another memory-writing 3D method
+    OtherEngine,       ///< A compute, DMA, inline-to-memory or 2D engine method
+    Deferred,          ///< Deferred work: puller releases, maps, flushes
+    AvoidedByRange,    ///< Not waited: the queued writes' ranges miss the read
+    Count,
+};
+
+inline constexpr std::array<const char*, static_cast<size_t>(DmaWaitCause::Count)>
+    dma_wait_cause_names{"compute/copy",  "host sync",    "cbuf upload",  "inline upload",
+                         "3D macro",      "report",       "dma launch",   "sync info",
+                         "wait for idle", "other 3D",     "other engine", "deferred",
+                         "avoided (range)"};
+
 struct ThreadData {
     std::array<u64, static_cast<size_t>(Zone::Count)> exclusive_ns{};
     std::array<u64, static_cast<size_t>(Zone::Count)> count{};
-    std::array<u64, 8> counters{}; ///< See Counter
+    std::array<u64, 16> counters{}; ///< See Counter
+    std::array<u64, static_cast<size_t>(DmaWaitCause::Count)> dma_wait_causes{};
     std::array<u64, static_cast<size_t>(DrainSite::Count)> drain_ns{};
     std::array<u64, static_cast<size_t>(DrainSite::Count)> drain_count{};
     u64 child_ns{};    ///< Time of the zones nested in the current one
@@ -157,7 +183,18 @@ enum class Counter : u32 {
     SameValueWrites, ///< Of MethodWrites: the register already held the value
     AcquireChecks,  ///< Semaphore acquires evaluated
     AcquireWaits,   ///< Of AcquireChecks: not met yet (the channel waits)
+    AcquiresQueued, ///< EDEN_NX2_FAST_DRAIN: acquires met by a release still queued for the back
+    AcquiresFast,   ///< EDEN_NX2_FAST_DRAIN: GEQUAL acquires met in memory without a drain
+    AcquireNoRelease,   ///< Drained acquires: no queued release of the word was recorded
+    AcquireReleaseRan,  ///< Drained acquires: the last release of the word already ran on the back
+    AcquireLaterWrite,  ///< Drained acquires: work sent after its release may write the word
+    AcquirePayloadMiss, ///< Drained acquires: the queued release's payload does not meet it
+    AcquireMetAfterDrain, ///< Drained acquires met at once after the drain
+    DmaReadsForwarded, ///< EDEN_NX2_FAST_DRAIN: MME DMA reads served from a queued upload
+    Count,
 };
+static_assert(static_cast<size_t>(Counter::Count) <=
+              std::tuple_size_v<decltype(ThreadData::counters)>);
 
 /// Method calls on this thread by method (3D registers on the back, macros on the front), and
 /// same-value writes among them; MME DMA reads by the macro that made them. The most frequent
@@ -226,6 +263,12 @@ inline void AddDrain(DrainSite site, u64 start) {
     }
 }
 
+inline void AddDmaWaitCause(DmaWaitCause cause) {
+    if (Enabled()) {
+        ++t_data.dma_wait_causes[static_cast<size_t>(cause)];
+    }
+}
+
 /// Called by the GPU thread (and the split's back thread) between commands: logs and resets
 /// the totals every 10 s.
 inline void Report(const char* thread_name = "GPU thread") {
@@ -276,6 +319,42 @@ inline void Report(const char* thread_name = "GPU thread") {
     line += fmt::format(" | acquires {:.0f} ({:.0f} waited)",
                         static_cast<double>(data.counters[6]) * 1e9 / window,
                         static_cast<double>(data.counters[7]) * 1e9 / window);
+    const auto rate = [&](Counter counter) {
+        return static_cast<double>(data.counters[static_cast<size_t>(counter)]) * 1e9 / window;
+    };
+    if (data.counters[static_cast<size_t>(Counter::AcquiresQueued)] != 0 ||
+        data.counters[static_cast<size_t>(Counter::AcquiresFast)] != 0) {
+        line += fmt::format(" | acquires without a drain: met by a queued release {:.0f}, "
+                            "GEQUAL met in memory {:.0f}",
+                            rate(Counter::AcquiresQueued), rate(Counter::AcquiresFast));
+    }
+    if (data.counters[static_cast<size_t>(Counter::AcquireNoRelease)] != 0 ||
+        data.counters[static_cast<size_t>(Counter::AcquireReleaseRan)] != 0 ||
+        data.counters[static_cast<size_t>(Counter::AcquireLaterWrite)] != 0 ||
+        data.counters[static_cast<size_t>(Counter::AcquirePayloadMiss)] != 0 ||
+        data.counters[static_cast<size_t>(Counter::AcquireMetAfterDrain)] != 0) {
+        line += fmt::format(" | drained acquires: no release {:.0f}, release ran {:.0f}, "
+                            "later write {:.0f}, payload miss {:.0f}, met after drain {:.0f}",
+                            rate(Counter::AcquireNoRelease), rate(Counter::AcquireReleaseRan),
+                            rate(Counter::AcquireLaterWrite), rate(Counter::AcquirePayloadMiss),
+                            rate(Counter::AcquireMetAfterDrain));
+    }
+    if (const u64 forwarded = data.counters[static_cast<size_t>(Counter::DmaReadsForwarded)];
+        forwarded != 0) {
+        line += fmt::format(" | MME DMA reads from queued uploads {:.0f}",
+                            rate(Counter::DmaReadsForwarded));
+    }
+    std::string causes;
+    for (size_t i = 0; i < data.dma_wait_causes.size(); ++i) {
+        if (data.dma_wait_causes[i] != 0) {
+            causes += fmt::format(" {} {:.0f}/s,", dma_wait_cause_names[i],
+                                  static_cast<double>(data.dma_wait_causes[i]) * 1e9 / window);
+        }
+    }
+    if (!causes.empty()) {
+        causes.pop_back();
+        line += " | macro dma reads waited for:" + causes;
+    }
     std::string drains;
     for (size_t i = 0; i < data.drain_count.size(); ++i) {
         if (data.drain_count[i] != 0) {

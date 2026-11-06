@@ -6,15 +6,23 @@
 #include <array>
 #include <atomic>
 #include <cstring>
+#include <deque>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <thread>
 #include <type_traits>
+#include <vector>
 
 #include "common/common_types.h"
+#include "video_core/engines/engine_interface.h"
 
 namespace Core {
 class System;
+}
+
+namespace Tegra {
+class MemoryManager;
 }
 
 namespace Tegra::Engines {
@@ -39,13 +47,14 @@ enum class DrainSite : u32 {
     Map,            ///< GPU memory maps before later command reads
     FrontStart,     ///< The front takes an engine's macros over
     FrontVerify,    ///< EDEN_NX2_FRONT_VERIFY
+    MacroDmaCheck,  ///< EDEN_NX2_CMDPAGE_DIAG: a fast-drain macro read repeated after a full drain
     Count,
 };
 
 inline constexpr std::array<const char*, static_cast<size_t>(DrainSite::Count)> drain_site_names{
     "other",       "fetch drain",     "acquire",    "semaphore flush", "fence release",
     "list writers", "list sync",      "list flush", "macro dma read",  "macro dma flush",
-    "gp sync fence", "map",           "front start", "front verify",
+    "gp sync fence", "map",           "front start", "front verify",  "macro dma check",
 };
 
 // Splits the GPU thread in two (NX2_GPU_THREAD_SPLIT.md). The GPU thread (the front) takes the
@@ -111,6 +120,9 @@ public:
             entry[1] = *segment;
         }
         Commit(words);
+        if (engine->memory_write_mask[method]) {
+            NoteMethodWrite(engine, method);
+        }
     }
     void MultiMethod(Tegra::Engines::EngineInterface* engine, u32 method, const u32* words,
                      u32 amount, u32 methods_pending, const GPUVAddr* segment);
@@ -121,11 +133,16 @@ public:
         entry[0] = static_cast<u64>(Kind::Method) | IsLast | Direct | (u64{method & 0xffff} << 8) |
                    (u64{argument} << 32);
         Commit(1);
+        if (engine->memory_write_mask[method]) {
+            NoteMethodWrite(engine, method);
+        }
     }
 
     /// Runs `func` on the back after everything sent before it. Must be trivially copyable.
+    /// `writes_memory`: whether it may write guest memory a macro read or acquire checks
+    /// (EDEN_NX2_FAST_DRAIN); false only for work known not to (draws, bookkeeping).
     template <typename Func>
-    void Defer(const Func& func) {
+    void Defer(const Func& func, bool writes_memory = true) {
         static_assert(std::is_trivially_copyable_v<Func> && alignof(Func) <= alignof(u64));
         constexpr size_t payload = (sizeof(Func) + sizeof(u64) - 1) / sizeof(u64);
         u64* const entry = Reserve(2 + payload);
@@ -133,6 +150,9 @@ public:
         entry[1] = reinterpret_cast<u64>(&CallThunk<Func>);
         std::memcpy(entry + 2, &func, sizeof(Func));
         Commit(2 + payload);
+        if (writes_memory) {
+            NoteMemoryWrite();
+        }
     }
     void DeferFunction(std::function<void()>&& func);
     /// Runs `func` on the back and waits for it: for work on back-owned state, such as a buffer
@@ -174,6 +194,55 @@ public:
     /// Waits until the back executed the work sent before the last NoteSync. Returns whether any
     /// of it was still queued.
     bool WaitForSync();
+
+    /// EDEN_NX2_FAST_DRAIN=1 (default off): the front's macro memory reads (MME DMA) wait only
+    /// for the queued work that may write the words, and take words a queued constant buffer
+    /// upload writes from the upload itself; semaphore acquires a queued release meets, or GEQUAL
+    /// acquires met in guest memory with nothing queued that may write the word, skip the drain.
+    /// Off, both drain everything queued.
+    [[nodiscard]] static bool FastDrain();
+
+    /// Deferred work that can write memory was just sent (puller releases, maps, flushes).
+    void NoteMemoryWrite() {
+        last_memory_write_position = write_position;
+        last_memory_write_method = DeferredWrite;
+    }
+    /// A method that writes memory was just sent (memory_write_mask); the method is kept for the
+    /// GPU profile.
+    void NoteMethodWrite(const Tegra::Engines::EngineInterface* engine, u32 method) {
+        previous_memory_write_position = last_memory_write_position;
+        previous_memory_write_method = last_memory_write_method;
+        last_memory_write_position = write_position;
+        // Engines all of whose methods write (DMA, inline-to-memory, 2D) mark method 0.
+        last_memory_write_method = engine->memory_write_mask[0] ? OtherEngineWrite : method;
+    }
+    /// The callers of RangeLastWrite and NoteRelease check FastDrain.
+    /// EDEN_NX2_FAST_DRAIN: the method just sent writes only [begin, end) of `memory`, so a macro
+    /// memory read waits for it only where they overlap, by GPU address in the same address space
+    /// or by device address (aliases, other channels). `data` (optional): the words it writes,
+    /// which ForwardRead may serve. Without this call the write counts for every read.
+    void RangeLastWrite(const Tegra::MemoryManager& memory, GPUVAddr begin, GPUVAddr end,
+                        const u32* data);
+    /// For a macro memory read of `words` words at `begin`: when the newest queued work that may
+    /// write them is one ranged constant buffer upload covering them all, copies its words to
+    /// `out` and returns true; the read then needs no wait.
+    bool ForwardRead(const Tegra::MemoryManager& memory, GPUVAddr begin, u32 words, u32* out);
+    /// For the front's macro memory reads of [begin, end): waits until the back executed the
+    /// writers that may have written it (memory_write_mask methods and Defer work; ranged writes
+    /// only where they overlap), the compute and copy work and the work before the last host-level
+    /// wait. Returns whether any of it was still queued.
+    bool WaitForMemoryWriters(DrainSite site, const Tegra::MemoryManager& memory, GPUVAddr begin,
+                              GPUVAddr end);
+    /// Whether WaitForMemoryWriters would wait now.
+    bool HasQueuedMemoryWriters(const Tegra::MemoryManager& memory, GPUVAddr begin, GPUVAddr end);
+    /// EDEN_NX2_FAST_DRAIN: a semaphore release that writes `payload` at device address `device`
+    /// was just sent (a puller release, a 3D or compute payload report).
+    void NoteRelease(DAddr device, u32 payload);
+    /// For a semaphore acquire at `address`: the payload a release still queued for the back
+    /// writes there, if nothing sent after it may write the word. `miss` (when none): 1 no
+    /// release recorded, 2 it already ran, 3 a later write.
+    std::optional<u32> QueuedReleasePayload(const Tegra::MemoryManager& memory, GPUVAddr address,
+                                            u32* miss = nullptr);
 
 private:
     friend struct GpuSplitTestAccess;
@@ -247,6 +316,43 @@ private:
     u64 write_position{};
     u64 last_writer_position{};
     u64 last_sync_position{};
+    u64 last_function_position{};
+    /// EDEN_NX2_FAST_DRAIN: the newest unranged memory writer and the method behind it.
+    u64 last_memory_write_position{};
+    static constexpr u32 DeferredWrite = ~0U;
+    static constexpr u32 OtherEngineWrite = ~0U - 1;
+    u32 last_memory_write_method{DeferredWrite};
+    u64 previous_memory_write_position{};
+    u32 previous_memory_write_method{DeferredWrite};
+    /// The range a ranged write or a read covers: GPU addresses in address space `space` (the
+    /// memory manager's ID + 1), and the device range when contiguous.
+    struct MemoryRange {
+        size_t space;
+        GPUVAddr begin;
+        GPUVAddr end;
+        std::optional<DAddr> device;
+    };
+    static MemoryRange Translate(const Tegra::MemoryManager& memory, GPUVAddr begin,
+                                 GPUVAddr end);
+    /// Writes with a known range (RangeLastWrite) the back may not have run yet, oldest first.
+    struct RangedWrite {
+        u64 position;
+        MemoryRange range; ///< Always with a device range
+        u32 method;
+        std::vector<u32> data; ///< The words written over the range, when known
+    };
+    static bool Overlaps(const RangedWrite& write, const MemoryRange& range);
+    static constexpr size_t MaxRangedWrites = 256;
+    std::deque<RangedWrite> ranged_writes;
+    struct QueuedRelease {
+        u64 position;
+        DAddr device;
+        u32 payload;
+    };
+    std::array<QueuedRelease, 64> queued_releases{};
+    /// Drops consumed ranged writes; returns the position a memory read of `range` waits for and
+    /// the method behind it.
+    u64 MemoryWriterTarget(u64 done, const MemoryRange& range, u32& target_method);
     u64 published_local{};
     u64 consumed_cache{};
     /// Words between publishes: small right after a drain, while the back has nothing to do.

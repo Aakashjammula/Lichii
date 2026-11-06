@@ -1214,6 +1214,22 @@ void KeplerCompute::FrontCallMethod(Core::System& system, VideoCommon::GpuSplit&
     }
     FrontApply(fs, method, argument);
     split.Method(this, method, argument, is_last_call, segment);
+    if (method == 0x6c3) {
+        FrontNoteRelease(split, fs, argument);
+    }
+}
+
+void KeplerCompute::FrontNoteRelease(VideoCommon::GpuSplit& split, const FrontState& fs,
+                                     u32 control) const {
+    // ProcessNativeReportSemaphore: a release (operation 0) without reduction writes the payload.
+    if (!VideoCommon::GpuSplit::FastDrain() || (control & 3) != 0 || ((control >> 3) & 1) != 0) {
+        return;
+    }
+    const GPUVAddr address =
+        (GPUVAddr{fs.registers[0x6c0] & 0x1ffffff} << 32) | fs.registers[0x6c1];
+    if (const auto device = memory_manager.GpuToCpuAddress(address)) {
+        split.NoteRelease(*device, fs.registers[0x6c2]);
+    }
 }
 
 void KeplerCompute::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit& split,
@@ -1253,6 +1269,9 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
         }
         FrontApply(fs, address, value);
         split.MacroWrite(this, address, value);
+        if (address == 0x6c3) {
+            FrontNoteRelease(split, fs, value);
+        }
         return true;
     };
 #ifdef ARCHITECTURE_x86_64

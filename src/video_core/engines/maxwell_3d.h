@@ -3405,6 +3405,12 @@ private:
     bool FrontSkipsLoopWrite(FrontState& state, u32 method, u32 value, bool shadow_kept);
     void FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& state, u32 macro, u32 method,
                       u32 count);
+    /// EDEN_NX2_FAST_DRAIN: the memory `amount` words of `method` write, if known (constant
+    /// buffer uploads, reports); {0, 0} otherwise.
+    std::pair<GPUVAddr, GPUVAddr> FrontWriteRange(const FrontState& state, u32 method,
+                                                  u32 amount) const;
+    /// Tells the split a report just sent releases a known payload (GpuSplit::NoteRelease).
+    void FrontNoteRelease(VideoCommon::GpuSplit& split, const FrontState& state, u32 query) const;
     void FrontVerify(VideoCommon::GpuSplit& split, FrontState& state);
     void FinishFrontMacro(Core::System& system);
     std::unique_ptr<FrontState> front;

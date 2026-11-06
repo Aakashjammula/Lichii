@@ -44,6 +44,12 @@ public:
     }
 
     std::bitset<(std::numeric_limits<u16>::max)()> execution_mask{};
+    /// Methods that can write memory in command order (uploads, reports, copies, dispatches):
+    /// with EDEN_NX2_FAST_DRAIN the split's front waits for the last one sent before its macros
+    /// read memory. Maxwell3D leaves draws and clears out: their writes are visible only after a
+    /// host-level wait.
+    std::bitset<(std::numeric_limits<u16>::max)()> memory_write_mask =
+        std::bitset<(std::numeric_limits<u16>::max)()>{}.set();
     /// A Maxwell3D whose CallMethod takes its fast path (Nx2Perf): GpuSplit's back calls it
     /// without the virtual call.
     bool fast_maxwell3d{};

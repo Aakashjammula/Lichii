@@ -62,6 +62,67 @@ void DrainBack() {
     VideoCommon::GpuSplit::Get().Drain(VideoCommon::DrainSite::Acquire);
 }
 
+// EDEN_NX2_FAST_DRAIN: a release still queued for the split's back meets the acquire. The back
+// runs it before anything the acquire's channel sends next, so the acquire needs no drain
+// (GpuSplit::QueuedReleasePayload). Ported from Frizti's b65e2bcc87.
+bool MetByQueuedRelease(DmaPusher& dma_pusher, const Puller::PendingAcquire& acquire) {
+    auto& split = VideoCommon::GpuSplit::Get();
+    if (!VideoCommon::GpuSplit::FastDrain() || !split.Active()) {
+        return false;
+    }
+    u32 miss = 0;
+    const auto payload =
+        split.QueuedReleasePayload(dma_pusher.memory_manager, acquire.address, &miss);
+    if (!payload || !acquire.Matches(*payload)) {
+        if (VideoCommon::Nx2Profile::Enabled()) {
+            using Counter = VideoCommon::Nx2Profile::Counter;
+            VideoCommon::Nx2Profile::Add(miss == 1   ? Counter::AcquireNoRelease
+                                         : miss == 2 ? Counter::AcquireReleaseRan
+                                         : miss == 3 ? Counter::AcquireLaterWrite
+                                                     : Counter::AcquirePayloadMiss,
+                                         1);
+        }
+        return false;
+    }
+    // A host sync for later GPU-written command lists, as the drain was.
+    split.NoteSync();
+    VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquiresQueued, 1);
+    return true;
+}
+
+// EDEN_NX2_FAST_DRAIN: a GEQUAL acquire whose word already holds the value continues without
+// draining the split, if nothing queued for the back may write the word (a release that lowers
+// it, a fence action) and no GPU work ever wrote its page (then no cache holds a newer word than
+// guest memory). Ported from zortos293/Lichii#166 via Dr. Sergio's 0c24f60d26 (level 1 only).
+bool GequalMetWithoutDrain(DmaPusher& dma_pusher, GPUVAddr address, u32 value) {
+    auto& split = VideoCommon::GpuSplit::Get();
+    if (!VideoCommon::GpuSplit::FastDrain() || !split.Active()) {
+        return false;
+    }
+    auto& memory = dma_pusher.memory_manager;
+    if (memory.OverlapsNativeSyncpointShim(address, sizeof(u32)) ||
+        split.HasQueuedMemoryWriters(memory, address, address + sizeof(u32))) {
+        return false;
+    }
+    const auto device = memory.GpuToCpuAddress(address);
+    if (!device || Nx2IsGpuWritten(*device) || memory.Read<u32>(address) < value) {
+        return false;
+    }
+    split.NoteSync();
+    VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquiresFast, 1);
+    return true;
+}
+
+// Tells the split a release of a known payload was just sent (EDEN_NX2_FAST_DRAIN).
+void NoteRelease(DmaPusher& dma_pusher, GPUVAddr address, u32 payload) {
+    if (auto& split = VideoCommon::GpuSplit::Get();
+        VideoCommon::GpuSplit::FastDrain() && split.Active()) {
+        if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(address)) {
+            split.NoteRelease(*device, payload);
+        }
+    }
+}
+
 // The fence manager records into the scheduler and downloads the CPU's writes over GPU data:
 // the back's state, which a drained back still uses from its idle hook (it submits).
 void ReleaseFences(DmaPusher& dma_pusher) {
@@ -87,6 +148,14 @@ bool Puller::PendingAcquire::Matches(u32 current) const {
 
 bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
     if (!pending_acquire) {
+        return true;
+    }
+    if (MetByQueuedRelease(dma_pusher, *pending_acquire)) {
+        return true;
+    }
+    if (static_cast<GpuSemaphoreOperation>(pending_acquire->operation) ==
+            GpuSemaphoreOperation::AcquireGequal &&
+        GequalMetWithoutDrain(dma_pusher, pending_acquire->address, pending_acquire->value)) {
         return true;
     }
     // The release may still be queued for the split GPU thread's back half (and the caches
@@ -238,6 +307,7 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         OnBack([rasterizer = dma_pusher.rasterizer, sequence_address, properties, payload] {
             rasterizer->Query(sequence_address, VideoCommon::QueryType::Payload, properties, payload, 0);
         });
+        NoteRelease(dma_pusher, sequence_address, payload);
     } else if (g_nx2_ampere) {
         // Switch 2 waits on semaphores the CPU (or another channel) releases, e.g. once it has
         // written the commands this channel runs next: suspend the channel until the value is
@@ -255,8 +325,16 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
             return;
         }
         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireChecks, 1);
+        if (MetByQueuedRelease(dma_pusher, acquire)) {
+            return;
+        }
+        if (op == GpuSemaphoreOperation::AcquireGequal &&
+            GequalMetWithoutDrain(dma_pusher, acquire.address, acquire.value)) {
+            return;
+        }
         DrainBack();
         if (acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address))) {
+            VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireMetAfterDrain, 1);
             return;
         }
         // Registered before the fences run, so a release among them that meets the value counts
@@ -312,6 +390,7 @@ void Puller::ProcessSemaphoreRelease(DmaPusher& dma_pusher) {
         rasterizer->Query(sequence_address, VideoCommon::QueryType::Payload,
                           VideoCommon::QueryPropertiesFlags::IsAFence, payload, 0);
     });
+    NoteRelease(dma_pusher, sequence_address, payload);
 }
 
 void Puller::ProcessSemaphoreAcquire(DmaPusher& dma_pusher) {

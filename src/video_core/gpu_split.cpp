@@ -115,6 +115,7 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     }
     system = &system_;
     check_owner = std::getenv("EDEN_NX2_SPLIT_CHECK") != nullptr;
+    static_cast<void>(FastDrain()); // Logs once when enabled
     ring = std::make_unique<u64[]>(RingWords);
     back_thread = std::jthread([this](std::stop_token stop_token) { BackLoop(stop_token); });
     active = true;
@@ -141,6 +142,13 @@ void GpuSplit::Stop() {
     write_position = 0;
     last_writer_position = 0;
     last_sync_position = 0;
+    last_function_position = 0;
+    last_memory_write_position = 0;
+    last_memory_write_method = DeferredWrite;
+    previous_memory_write_position = 0;
+    previous_memory_write_method = DeferredWrite;
+    ranged_writes.clear();
+    queued_releases = {};
     published_local = 0;
     consumed_cache = 0;
     publish_every = PublishEvery;
@@ -226,6 +234,239 @@ bool GpuSplit::WaitForSync() {
     return WaitFor(std::min(last_sync_position, write_position), DrainSite::ListSync);
 }
 
+bool GpuSplit::FastDrain() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_FAST_DRAIN");
+        const bool on = value != nullptr && value[0] != '\0' && value[0] != '0';
+        if (on) {
+            LOG_INFO(HW_GPU, "EDEN_NX2_FAST_DRAIN: macro memory reads wait only for overlapping "
+                             "writers; acquires met by queued releases skip the split drain");
+        }
+        return on;
+    }();
+    return enabled;
+}
+
+GpuSplit::MemoryRange GpuSplit::Translate(const Tegra::MemoryManager& memory, GPUVAddr begin,
+                                          GPUVAddr end) {
+    MemoryRange range{memory.GetID() + 1, begin, end, std::nullopt};
+    // Sparse pages are written through their own backing: no device range.
+    if (begin >= end || (begin < Tegra::g_nx2_sparse_high.load(std::memory_order_relaxed) &&
+                         Tegra::g_nx2_sparse_low.load(std::memory_order_relaxed) < end)) {
+        return range;
+    }
+    const std::optional<DAddr> base = memory.GpuToCpuAddress(begin);
+    if (!base) {
+        return range;
+    }
+    constexpr GPUVAddr page_size = 0x1000;
+    for (GPUVAddr page = (begin & ~(page_size - 1)) + page_size; page < end; page += page_size) {
+        const std::optional<DAddr> device = memory.GpuToCpuAddress(page);
+        if (!device || *device != *base + (page - begin)) {
+            return range;
+        }
+    }
+    range.device = *base;
+    return range;
+}
+
+bool GpuSplit::Overlaps(const RangedWrite& write, const MemoryRange& range) {
+    const MemoryRange& written = write.range;
+    if (written.space == range.space && written.begin < range.end && range.begin < written.end) {
+        return true;
+    }
+    // A read without a device range may alias any write.
+    if (!range.device) {
+        return true;
+    }
+    const DAddr write_begin = *written.device;
+    const DAddr write_end = write_begin + (written.end - written.begin);
+    return write_begin < *range.device + (range.end - range.begin) && *range.device < write_end;
+}
+
+void GpuSplit::RangeLastWrite(const Tegra::MemoryManager& memory, GPUVAddr begin, GPUVAddr end,
+                              const u32* data) {
+    // Only the method that was just sent: anything after it keeps its unranged mark. While a
+    // queued function may still change the mappings, the back may translate differently.
+    if (begin >= end || last_memory_write_position != write_position ||
+        last_function_position > consumed.load(std::memory_order_acquire)) {
+        return;
+    }
+    MemoryRange range = Translate(memory, begin, end);
+    if (!range.device) {
+        return;
+    }
+    const u32 method = last_memory_write_method;
+    last_memory_write_position = previous_memory_write_position;
+    last_memory_write_method = previous_memory_write_method;
+    const size_t words = static_cast<size_t>(end - begin) / sizeof(u32);
+    if ((end - begin) % sizeof(u32) != 0) {
+        data = nullptr;
+    }
+    // Consecutive uploads continue one range (each word may use another of the 16 data methods).
+    if (!ranged_writes.empty()) {
+        RangedWrite& last = ranged_writes.back();
+        const MemoryRange& previous = last.range;
+        if (previous.space == range.space && previous.end == begin &&
+            *previous.device + (previous.end - previous.begin) == *range.device) {
+            // An unranged write sent since may have changed the older words: keep none.
+            const bool written_since =
+                std::max({last_writer_position, last_sync_position, last_memory_write_position}) >
+                last.position;
+            last.range.end = end;
+            last.position = write_position;
+            last.method = method;
+            if (data != nullptr && !written_since &&
+                last.data.size() * sizeof(u32) == static_cast<size_t>(begin - previous.begin)) {
+                last.data.insert(last.data.end(), data, data + words);
+            } else {
+                last.data.clear();
+            }
+            return;
+        }
+    }
+    if (ranged_writes.size() == MaxRangedWrites) {
+        // Too many in flight: the oldest counts for every read again.
+        const RangedWrite& oldest = ranged_writes.front();
+        if (oldest.position > last_memory_write_position) {
+            last_memory_write_position = oldest.position;
+            last_memory_write_method = oldest.method;
+        }
+        ranged_writes.pop_front();
+    }
+    RangedWrite& write = ranged_writes.emplace_back(RangedWrite{write_position, range, method, {}});
+    if (data != nullptr) {
+        write.data.assign(data, data + words);
+    }
+}
+
+u64 GpuSplit::MemoryWriterTarget(u64 done, const MemoryRange& range, u32& target_method) {
+    while (!ranged_writes.empty() && ranged_writes.front().position <= done) {
+        ranged_writes.pop_front();
+    }
+    u64 target = std::max({last_writer_position, last_sync_position, last_memory_write_position});
+    target_method = last_memory_write_method;
+    for (const RangedWrite& write : ranged_writes) {
+        if (write.position > target && Overlaps(write, range)) {
+            target = write.position;
+            target_method = write.method;
+        }
+    }
+    return std::min(target, write_position);
+}
+
+bool GpuSplit::ForwardRead(const Tegra::MemoryManager& memory, GPUVAddr begin, u32 words,
+                           u32* out) {
+    const GPUVAddr end = begin + GPUVAddr{words} * sizeof(u32);
+    const MemoryRange range = Translate(memory, begin, end);
+    const u64 done = consumed.load(std::memory_order_acquire);
+    u32 method{};
+    const u64 target = MemoryWriterTarget(done, range, method);
+    if (target <= done || words == 0) {
+        return false; // Nothing to wait for: memory holds the words
+    }
+    // The newest overlapping write must be one upload covering the read in the same address
+    // space, with its words known.
+    for (auto it = ranged_writes.rbegin(); it != ranged_writes.rend(); ++it) {
+        if (!Overlaps(*it, range)) {
+            continue;
+        }
+        const MemoryRange& written = it->range;
+        if (it->position != target || written.space != range.space || begin < written.begin ||
+            end > written.end || (begin - written.begin) % sizeof(u32) != 0 ||
+            it->data.size() * sizeof(u32) != static_cast<size_t>(written.end - written.begin)) {
+            return false;
+        }
+        std::memcpy(out, it->data.data() + (begin - written.begin) / sizeof(u32),
+                    size_t{words} * sizeof(u32));
+        return true;
+    }
+    return false;
+}
+
+bool GpuSplit::WaitForMemoryWriters(DrainSite site, const Tegra::MemoryManager& memory,
+                                    GPUVAddr begin, GPUVAddr end) {
+    const MemoryRange range = Translate(memory, begin, end);
+    const u64 done = consumed.load(std::memory_order_acquire);
+    u32 target_method{};
+    const u64 target = MemoryWriterTarget(done, range, target_method);
+    if (Nx2Profile::Enabled()) {
+        // What the read waits for: the newest writer it depends on.
+        using Cause = Nx2Profile::DmaWaitCause;
+        const u64 unranged =
+            std::max({last_writer_position, last_sync_position, last_memory_write_position});
+        const u64 all_writes =
+            ranged_writes.empty() ? unranged : std::max(unranged, ranged_writes.back().position);
+        if (done < target) {
+            Cause cause = Cause::HostSync;
+            if (target != last_writer_position && target != last_sync_position) {
+                const u32 method = target_method;
+                cause = method == DeferredWrite               ? Cause::Deferred
+                        : method == OtherEngineWrite          ? Cause::OtherEngine
+                        : method >= 0x8e4 && method < 0x8f4   ? Cause::ConstBufferUpload
+                        : method == 0x6d                      ? Cause::InlineUpload
+                        : method == 0x6c3                     ? Cause::Report
+                        : method == 0x6c                      ? Cause::DmaLaunch
+                        : method == 0xb2                      ? Cause::SyncInfo
+                        : method == 0x44                      ? Cause::WaitForIdle
+                        : method >= 0xe00                     ? Cause::Macro3D
+                                                              : Cause::Other3D;
+            } else if (target == last_writer_position) {
+                cause = Cause::ComputeCopy;
+            }
+            Nx2Profile::AddDmaWaitCause(cause);
+        } else if (done < std::min(all_writes, write_position)) {
+            Nx2Profile::AddDmaWaitCause(Cause::AvoidedByRange);
+        }
+    }
+    return WaitFor(target, site);
+}
+
+bool GpuSplit::HasQueuedMemoryWriters(const Tegra::MemoryManager& memory, GPUVAddr begin,
+                                      GPUVAddr end) {
+    const MemoryRange range = Translate(memory, begin, end);
+    const u64 done = consumed.load(std::memory_order_acquire);
+    u32 method{};
+    return MemoryWriterTarget(done, range, method) > done;
+}
+
+void GpuSplit::NoteRelease(DAddr device, u32 payload) {
+    queued_releases[(device >> 2) % queued_releases.size()] = {write_position, device, payload};
+}
+
+std::optional<u32> GpuSplit::QueuedReleasePayload(const Tegra::MemoryManager& memory,
+                                                  GPUVAddr address, u32* miss) {
+    const MemoryRange range = Translate(memory, address, address + sizeof(u32));
+    const auto set_miss = [miss](u32 reason) {
+        if (miss != nullptr) {
+            *miss = reason;
+        }
+    };
+    if (!range.device) {
+        set_miss(1);
+        return std::nullopt;
+    }
+    const QueuedRelease& release =
+        queued_releases[(*range.device >> 2) % queued_releases.size()];
+    const u64 done = consumed.load(std::memory_order_acquire);
+    if (release.device != *range.device || release.position == 0) {
+        set_miss(1);
+        return std::nullopt;
+    }
+    if (release.position <= done) {
+        set_miss(2);
+        return std::nullopt;
+    }
+    // Any write sent after the release (an unranged one, or a ranged one to the word) may change
+    // the word before the acquire runs.
+    u32 method{};
+    if (MemoryWriterTarget(done, range, method) > release.position) {
+        set_miss(3);
+        return std::nullopt;
+    }
+    return release.payload;
+}
+
 bool GpuSplit::WaitFor(u64 target, DrainSite site) {
     consumed_cache = consumed.load(std::memory_order_acquire);
     if (consumed_cache >= target) {
@@ -296,6 +537,9 @@ void GpuSplit::MultiMethod(Tegra::Engines::EngineInterface* engine, u32 method, 
         amount -= piece;
         methods_pending -= piece;
     }
+    if (engine->memory_write_mask[method]) {
+        NoteMethodWrite(engine, method);
+    }
 }
 
 void GpuSplit::DeferFunction(std::function<void()>&& func) {
@@ -304,6 +548,7 @@ void GpuSplit::DeferFunction(std::function<void()>&& func) {
         (*heap)();
         delete heap;
     });
+    last_function_position = write_position;
 }
 
 size_t GpuSplit::Execute(const u64* entry, size_t words) {
