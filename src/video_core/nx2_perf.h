@@ -21,4 +21,8 @@ inline bool Verify() {
 /// unknown or unpaced. The host frame pacer (vk_host_pacer.h) never holds frames longer.
 inline std::atomic<long long> g_guest_frame_interval_ns{0};
 
+/// The display's measured refresh period while the host frame pacer runs, else 0. The game's
+/// present pacing (nx2_gsv.h) times its frames to whole multiples of it (genlock).
+inline std::atomic<long long> g_host_refresh_ns{0};
+
 } // namespace VideoCommon::Nx2Perf

@@ -1947,8 +1947,23 @@ private:
             LOG_INFO(Service, "nx2:vi2 present #{} swap interval {} at {} Hz (word 12 = {:#x})",
                      m_presents, swap_interval, refresh_rate, timing);
         }
-        const auto interval = std::chrono::nanoseconds{
+        auto interval = std::chrono::nanoseconds{
             100'000'000'000LL * swap_interval / refresh_rate / Settings::SpeedLimit()};
+        // Genlock: with the host frame pacer on, a frame period within 1% of a whole number of
+        // display refreshes becomes exactly that many measured refreshes (a "120 Hz" display at
+        // 119.98 Hz: 33.3389 ms instead of 33.3333). On the game's own clock its frames drifted
+        // against the display and missed their refresh about once a minute (a 41 ms frame, then
+        // a short one). The game runs at most 1% slower.
+        if (const long long host_refresh =
+                VideoCommon::Nx2Perf::g_host_refresh_ns.load(std::memory_order_relaxed);
+            host_refresh > 0) {
+            const long long refreshes =
+                (interval.count() + host_refresh / 2) / host_refresh;
+            const long long locked = refreshes * host_refresh;
+            if (refreshes >= 1 && std::abs(locked - interval.count()) * 100 < interval.count()) {
+                interval = std::chrono::nanoseconds{locked};
+            }
+        }
         VideoCommon::Nx2Perf::g_guest_frame_interval_ns.store(interval.count(),
                                                               std::memory_order_relaxed);
         if (trace) {

@@ -70,8 +70,11 @@ private:
     void Report(Clock::time_point now);
 
     bool pacing{};
-    double refresh_ns{1e9 / 60.0};
+    double refresh_ns{1e9 / 60.0};         ///< Measured when known, else the compositor's
+    double nominal_refresh_ns{1e9 / 60.0}; ///< The compositor's
     bool refresh_known{};
+    std::optional<Clock::time_point> anchor; ///< Refresh the measurement counts from
+    u64 anchor_refreshes{};
     Clock::time_point next_refresh_query{};
 
     std::optional<Clock::time_point> last_queued;

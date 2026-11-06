@@ -58,17 +58,21 @@ void HostPacer::Refresh(Clock::time_point now, bool allowed) {
     if (now >= next_refresh_query) {
         next_refresh_query = now + std::chrono::seconds{2};
         if (const auto period = QueryRefreshPeriodNs(); period && *period > 2e6 && *period < 50e6) {
-            if (!refresh_known || std::abs(*period - refresh_ns) > refresh_ns * 0.01) {
+            if (!refresh_known || std::abs(*period - nominal_refresh_ns) > nominal_refresh_ns * 0.01) {
                 LOG_INFO(Render_Vulkan, "Host pacing: display refresh {:.3f} Hz", 1e9 / *period);
                 vblank.reset();
+                anchor.reset();
+                refresh_ns = *period;
             }
-            refresh_ns = *period;
+            nominal_refresh_ns = *period;
             refresh_known = true;
         }
     }
     pacing = allowed && refresh_known &&
              VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_host_pace,
                                               "EDEN_NX2_HOST_PACE", 0) != 0;
+    VideoCommon::Nx2Perf::g_host_refresh_ns.store(
+        pacing ? static_cast<long long>(refresh_ns) : 0, std::memory_order_relaxed);
 }
 
 HostPacer::Clock::time_point HostPacer::Target(Clock::time_point now) {
@@ -91,7 +95,8 @@ HostPacer::Clock::time_point HostPacer::Target(Clock::time_point now) {
     // A late frame moves the schedule a refresh later for good, and the frames after it then
     // wait that refresh in the queue (input lag). Once frames could have been shown a refresh
     // earlier for 2 s in a row, show one a refresh early (one short frame) to drop that wait.
-    if (k > 1 && intended - ToNs(refresh_ns + lead_ns + 1e6) > now) {
+    // Not at 30 fps and below (k > 2): there every frame must stay on screen equally long.
+    if (k == 2 && intended - ToNs(refresh_ns + lead_ns + 1e6) > now) {
         if (++early_streak >= 120) {
             early_streak = 0;
             intended -= ToNs(refresh_ns);
@@ -162,11 +167,34 @@ void HostPacer::NoteShown(u64 id, Clock::time_point shown, bool was_lost) {
         if (refreshes >= 1) {
             const auto predicted = *vblank + ToNs(static_cast<double>(refreshes) * refresh_ns);
             const double residual = static_cast<double>(Ns{shown - predicted}.count());
-            vblank = std::abs(residual) < refresh_ns * 0.5 ? predicted + ToNs(residual * 0.1)
-                                                            : shown;
+            if (std::abs(residual) < refresh_ns * 0.5) {
+                vblank = predicted + ToNs(residual * 0.1);
+                anchor_refreshes += static_cast<u64>(refreshes);
+            } else {
+                vblank = shown;
+                anchor.reset();
+            }
         }
     } else {
         vblank = shown;
+        anchor.reset();
+    }
+    // Measure the display's real refresh period over the refreshes counted since an anchor (a
+    // "120 Hz" display can run at 119.98): the game's frame clock follows it (genlock), so its
+    // frames don't drift out of their refresh slots once a minute.
+    if (!anchor) {
+        anchor = vblank;
+        anchor_refreshes = 0;
+    } else if (anchor_refreshes >= 1200) {
+        const double measured =
+            static_cast<double>(Ns{*vblank - *anchor}.count()) / static_cast<double>(anchor_refreshes);
+        if (std::abs(measured - nominal_refresh_ns) < nominal_refresh_ns * 0.005) {
+            refresh_ns = measured;
+        }
+        if (anchor_refreshes >= 12000) {
+            anchor = vblank;
+            anchor_refreshes = 0;
+        }
     }
     if (entry && entry->intended) {
         if (shown > *entry->intended + ToNs(refresh_ns * 0.5)) {
