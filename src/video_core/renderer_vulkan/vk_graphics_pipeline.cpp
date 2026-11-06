@@ -60,6 +60,16 @@ using VideoCore::Surface::PixelFormatFromRenderTargetFormat;
 
 constexpr size_t NUM_STAGES = Maxwell::MaxShaderStage;
 
+// EDEN_NX2_CLAIM_HELD_BUILD=1: a held draw claims its worker-only build instead of waiting
+// behind every pipeline queued on the FIFO workers (zortos293/Lichii PR #321).
+bool ClaimHeldBuild() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_CLAIM_HELD_BUILD");
+        return value && value[0] == '1';
+    }();
+    return enabled;
+}
+
 // The stage of a program: task and mesh programs sit in the vertex and tessellation slots.
 VkShaderStageFlagBits StageFlag(const Shader::Info& info, VkShaderStageFlagBits slot_stage) {
     if (info.is_task) {
@@ -759,7 +769,7 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
         // Wait for the pipeline to be built
         scheduler.Record([this](vk::CommandBuffer) {
             const auto begin = std::chrono::steady_clock::now();
-            build->Wait(!worker_only_build);
+            build->Wait(!worker_only_build || ClaimHeldBuild());
             hold_time_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                        std::chrono::steady_clock::now() - begin)
                                        .count(),
