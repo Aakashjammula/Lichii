@@ -18,6 +18,27 @@
 /// Without the server nothing is posted and the per-frame cost is one relaxed atomic load.
 namespace VideoCore::Nx2Debug {
 
+/// Switch read from the environment on first use (also settable live by the debug server).
+[[nodiscard]] inline int EnvSwitch(const char* name) {
+    const char* value = std::getenv(name);
+    return value == nullptr ? 0 : std::atoi(value); // whole number: EDEN_NX2_DMA_SNAPSHOT=10
+}
+/// The switch's value, read from the environment on first use (-1: not read yet). Static
+/// initialization ran before the frontend applied nx2_switches.txt, so those settings were lost.
+[[nodiscard]] inline int SwitchValue(std::atomic<int>& value, const char* name,
+                                    int fallback = 0) {
+    int current = value.load(std::memory_order_relaxed);
+    if (current < 0) [[unlikely]] {
+        int unset = -1;
+        const int initial = std::getenv(name) != nullptr ? EnvSwitch(name) : fallback;
+        value.compare_exchange_strong(unset, initial, std::memory_order_relaxed);
+        current = value.load(std::memory_order_relaxed);
+    }
+    return current;
+}
+/// EDEN_NX2_HOST_PACE: the host frame pacer (vk_host_pacer.h, from Frizti/Lichii). 1 = pace
+/// presents to the display refreshes; unset/0 = only measure how long each frame was shown.
+inline std::atomic<int> g_host_pace{-1};
 struct CaptureRequest {
     u64 id;
     std::filesystem::path directory;

@@ -1890,6 +1890,7 @@ private:
     // present faster than that. Every slot is reported free here: hold each present until the
     // next vblank instead (title 4 ran at up to 160 fps, its timing and audio with it).
     Nx2PresentPacer m_present_pacer;
+    double m_host_slack_ns{3e6}; ///< Smoothed g_host_pace_slack_ns
     u32 m_swap_word{};
 
     struct FrameTrace {
@@ -1940,6 +1941,7 @@ private:
             m_frame_trace.forced = forced_interval;
         }
         if (!Settings::values.use_speed_limit.GetValue() || Settings::SpeedLimit() == 0) {
+            VideoCommon::Nx2Perf::g_guest_frame_interval_ns.store(0, std::memory_order_relaxed);
             return;
         }
         if (timing != std::exchange(m_swap_word, timing)) {
@@ -1948,8 +1950,24 @@ private:
         }
         const auto interval = std::chrono::nanoseconds{
             100'000'000'000LL * swap_interval / refresh_rate / Settings::SpeedLimit()};
+        VideoCommon::Nx2Perf::g_guest_frame_interval_ns.store(interval.count(),
+                                                              std::memory_order_relaxed);
         if (trace) {
             m_frame_trace.target_ms = std::chrono::duration<double, std::milli>(interval).count();
+        }
+        // Follow the host frame pacer (vk_host_pacer.h): while it holds frames more than ~3 ms
+        // before their display refresh, they waited in the queue (a refresh of input lag after
+        // one late frame moved its schedule); start frames a little later, at most 0.5 ms a
+        // frame, so the phase moves without a visible step. Earlier again (0.1 ms a frame)
+        // while frames reach it late.
+        if (const long long slack =
+                VideoCommon::Nx2Perf::g_host_pace_slack_ns.load(std::memory_order_relaxed);
+            slack != VideoCommon::Nx2Perf::kHostPaceOff) {
+            m_host_slack_ns += (static_cast<double>(slack) - m_host_slack_ns) * 0.2;
+            const double shift = std::clamp((m_host_slack_ns - 3e6) * 0.1, -0.1e6, 0.5e6);
+            m_present_pacer.Shift(std::chrono::nanoseconds{static_cast<s64>(shift)});
+        } else {
+            m_host_slack_ns = 3e6;
         }
         const auto now = std::chrono::steady_clock::now();
         const auto pacing = m_present_pacer.Advance(now, interval);
