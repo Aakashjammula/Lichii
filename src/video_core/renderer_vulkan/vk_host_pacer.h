@@ -56,6 +56,9 @@ public:
         return outstanding;
     }
 
+    /// Time from `now` to the display's next refresh, or -1 while the refresh grid is unknown.
+    [[nodiscard]] long long NsToNextRefresh(Clock::time_point now) const;
+
     [[nodiscard]] std::chrono::nanoseconds RefreshPeriod() const {
         return std::chrono::nanoseconds{static_cast<s64>(refresh_ns)};
     }

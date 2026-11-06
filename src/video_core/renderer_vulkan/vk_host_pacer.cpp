@@ -104,10 +104,11 @@ HostPacer::Clock::time_point HostPacer::Target(Clock::time_point now) {
     auto intended = *vblank + ToNs(static_cast<double>(k) * refresh_ns);
     // A late frame moves the schedule a refresh later for good, and the frames after it then
     // wait that refresh in the queue (input lag). Once frames could have been shown a refresh
-    // earlier for 2 s in a row, show one a refresh early (one short frame) to drop that wait.
-    // Not at 30 fps and below (k > 2): there every frame must stay on screen equally long.
-    if (k == 2 && intended - ToNs(refresh_ns + lead_ns + 1e6) > now) {
-        if (++early_streak >= 120) {
+    // earlier for 2 s (1 s at 30 fps and below) in a row, show one a refresh early (one short
+    // frame) to drop that wait. At 30 fps without it, Ocarina's frames waited ~30 ms each after
+    // a few hitches: nearly a frame of extra input lag.
+    if (k >= 2 && intended - ToNs(refresh_ns + lead_ns + 1e6) > now) {
+        if (++early_streak >= (k == 2 ? 120U : 30U)) {
             early_streak = 0;
             intended -= ToNs(refresh_ns);
             ++caught_up;
@@ -121,6 +122,15 @@ HostPacer::Clock::time_point HostPacer::Target(Clock::time_point now) {
     }
     pending_intended = intended;
     return target;
+}
+
+long long HostPacer::NsToNextRefresh(Clock::time_point now) const {
+    if (!vblank || !pacing) {
+        return -1;
+    }
+    const double since = static_cast<double>(Ns{now - *vblank}.count());
+    const double into = std::fmod(std::fmod(since, refresh_ns) + refresh_ns, refresh_ns);
+    return static_cast<long long>(refresh_ns - into);
 }
 
 void HostPacer::NoteSubmitted(u64 id, Clock::time_point submitted_at, bool was_held) {

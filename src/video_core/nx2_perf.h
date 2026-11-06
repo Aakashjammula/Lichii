@@ -25,4 +25,10 @@ inline std::atomic<long long> g_guest_frame_interval_ns{0};
 /// present pacing (nx2_gsv.h) times its frames to whole multiples of it (genlock).
 inline std::atomic<long long> g_host_refresh_ns{0};
 
+/// At 30 FPS and below the host frame pacer presents frames as soon as they are rendered and
+/// publishes how long before the display's next refresh the last one was ready (ns), or -1
+/// while it isn't pacing that way. The game's present pacing (nx2_gsv.h) moves its frames until
+/// that is ~6 ms: each lands on a refresh with little wait (input lag) and evenly spaced.
+inline std::atomic<long long> g_host_phase_ns{-1};
+
 } // namespace VideoCommon::Nx2Perf

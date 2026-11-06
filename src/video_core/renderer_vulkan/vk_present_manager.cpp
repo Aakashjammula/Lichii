@@ -15,6 +15,7 @@
 #ifdef HAS_LSFG
 #include "video_core/renderer_vulkan/present/lsfg_common.h"
 #endif
+#include "video_core/nx2_perf.h"
 #include "video_core/renderer_vulkan/vk_present_manager.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_swapchain.h"
@@ -421,6 +422,7 @@ bool PresentManager::PaceFrame(Frame* frame, std::stop_token token) {
     }
     DrainShown();
     if (!pacer.Pacing()) {
+        VideoCommon::Nx2Perf::g_host_phase_ns.store(-1, std::memory_order_relaxed);
         return false;
     }
     if (frame->render_tick != 0) {
@@ -430,6 +432,33 @@ bool PresentManager::PaceFrame(Frame* frame, std::stop_token token) {
         scheduler.GetMasterSemaphore().Wait(frame->render_tick);
     }
     const auto start = Clock::now();
+    // 30 FPS and below: no hold. Holding a frame for its refresh kept the GPU thread from
+    // getting a frame for the next one, so every frame arrived right after the last was shown
+    // and waited a whole frame (~30 ms of input lag). The game's pacing lines its frames up with
+    // the refreshes instead (g_host_phase_ns).
+    if (VideoCommon::Nx2Perf::g_guest_frame_interval_ns.load(std::memory_order_relaxed) >=
+        25'000'000) {
+        VideoCommon::Nx2Perf::g_host_phase_ns.store(pacer.NsToNextRefresh(start),
+                                                    std::memory_order_relaxed);
+        // Only a short hold, for a frame that would be shown a refresh early (after a late
+        // one): longer ones are what backed the frames up.
+        const auto target = pacer.Target(start);
+        if (target <= start || target - start >= pacer.RefreshPeriod()) {
+            return false;
+        }
+        Common::Nx2Timeline::Span span{"present: host pacing hold"};
+        for (auto now = start; now < target && !token.stop_requested(); now = Clock::now()) {
+            const auto left = target - now;
+            if (left > std::chrono::microseconds{1500}) {
+                std::this_thread::sleep_for(left - std::chrono::microseconds{1000});
+            } else {
+                std::this_thread::yield();
+            }
+        }
+        pacer.NoteHold(Clock::now() - start);
+        return true;
+    }
+    VideoCommon::Nx2Perf::g_host_phase_ns.store(-1, std::memory_order_relaxed);
     const auto target = pacer.Target(start);
     if (target <= start) {
         return false;
