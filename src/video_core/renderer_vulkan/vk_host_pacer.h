@@ -82,13 +82,14 @@ private:
     u64 last_shown_id{};
     std::optional<Clock::time_point> pending_intended;
     double lead_ns{2.0e6};
+    u32 early_streak{}; ///< Frames in a row that could have been shown a refresh earlier
     u64 outstanding{};
     std::deque<Submitted> submitted;
 
     // Reported every 10 s.
     Clock::time_point report_start{};
     std::array<u32, 6> refreshes_shown{}; // 0 (same refresh), 1, 2, 3, 4, 5+
-    u32 frames{}, held{}, missed{}, lost{};
+    u32 frames{}, held{}, missed{}, lost{}, caught_up{};
     double interval_sum_ms{}, interval_max_ms{}, hold_sum_ms{}, latency_sum_ms{};
 };
 

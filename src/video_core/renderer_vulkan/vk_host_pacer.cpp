@@ -87,7 +87,19 @@ HostPacer::Clock::time_point HostPacer::Target(Clock::time_point now) {
         guest_ns > 0
             ? (std::max<s64>)(1, static_cast<s64>(std::floor(guest_ns / refresh_ns + 0.02)))
             : 1;
-    const auto intended = *vblank + ToNs(static_cast<double>(k) * refresh_ns);
+    auto intended = *vblank + ToNs(static_cast<double>(k) * refresh_ns);
+    // A late frame moves the schedule a refresh later for good, and the frames after it then
+    // wait that refresh in the queue (input lag). Once frames could have been shown a refresh
+    // earlier for 2 s in a row, show one a refresh early (one short frame) to drop that wait.
+    if (k > 1 && intended - ToNs(refresh_ns + lead_ns + 1e6) > now) {
+        if (++early_streak >= 120) {
+            early_streak = 0;
+            intended -= ToNs(refresh_ns);
+            ++caught_up;
+        }
+    } else {
+        early_streak = 0;
+    }
     const auto target = intended - ToNs(lead_ns);
     if (target <= now) {
         return now;
@@ -186,15 +198,15 @@ void HostPacer::Report(Clock::time_point now) {
              "Host pacing {}: {} frames at {:.2f} Hz; shown for 1/2/3/4/5+ refreshes: "
              "{}/{}/{}/{}/{} (same refresh {}); interval mean {:.2f} ms, max {:.2f}; held {} "
              "(mean {:.2f} ms, missed {}), lead {:.2f} ms; present to shown {:.2f} ms; game "
-             "frame {:.2f} ms; {} lost",
+             "frame {:.2f} ms; {} lost; caught up {}",
              pacing ? "on" : "off", frames, 1e9 / refresh_ns, refreshes_shown[1],
              refreshes_shown[2], refreshes_shown[3], refreshes_shown[4], refreshes_shown[5],
              refreshes_shown[0], intervals ? interval_sum_ms / intervals : 0.0, interval_max_ms,
              held, held ? hold_sum_ms / held : 0.0, missed, lead_ns / 1e6,
-             latency_sum_ms / frames, content_ns / 1e6, lost);
+             latency_sum_ms / frames, content_ns / 1e6, lost, caught_up);
     report_start = now;
     refreshes_shown = {};
-    frames = held = missed = lost = 0;
+    frames = held = missed = lost = caught_up = 0;
     interval_sum_ms = interval_max_ms = hold_sum_ms = latency_sum_ms = 0;
 }
 
