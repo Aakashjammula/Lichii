@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdlib>
 #include <mutex>
 #include <span>
 #include <string>
@@ -116,11 +117,12 @@ void EvaluateTextureHandles(const Shader::Info& info, u32 program, Memory& gpu_m
 
 /// Logs what the elements of a descriptor array of handle program results (a table of per-light
 /// shadow maps, say) hold, whenever that changes, for the first lines: how many distinct textures
-/// and which, by TIC index with the first element holding each.
+/// and which, by TIC index with the first element holding each. Off unless
+/// EDEN_NX2_HANDLE_TABLE_NOTES is set, so draws and dispatches don't gather the tables for it.
 class HandleTableNotes {
 public:
     [[nodiscard]] static bool Wanted() noexcept {
-        return lines.load(std::memory_order_relaxed) < MAX_LINES;
+        return enabled && lines.load(std::memory_order_relaxed) < MAX_LINES;
     }
 
     static void Note(u64 shader, u32 texture, std::span<const u32> tics) {
@@ -156,6 +158,7 @@ public:
 
 private:
     static constexpr int MAX_LINES = 64;
+    inline static const bool enabled{std::getenv("EDEN_NX2_HANDLE_TABLE_NOTES") != nullptr};
     inline static std::atomic<int> lines{};
     inline static std::mutex mutex;
     inline static std::unordered_map<u64, std::vector<u32>> seen;
