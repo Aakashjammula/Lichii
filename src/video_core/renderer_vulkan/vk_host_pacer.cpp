@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 
 #include "common/logging.h"
 #include "video_core/nx2_debug_control.h"
@@ -50,6 +51,15 @@ std::optional<double> QueryRefreshPeriodNs() {
     if (EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &mode) &&
         mode.dmDisplayFrequency > 1) {
         return 1e9 / mode.dmDisplayFrequency;
+    }
+#else
+    // No compositor timing query here: EDEN_NX2_DISPLAY_HZ=<rate> (e.g. 179.98) gives the
+    // display's refresh rate; without it the pacer only measures.
+    if (const char* value = std::getenv("EDEN_NX2_DISPLAY_HZ")) {
+        const double hz = std::strtod(value, nullptr);
+        if (hz > 20.0 && hz < 500.0) {
+            return 1e9 / hz;
+        }
     }
 #endif
     return std::nullopt;
