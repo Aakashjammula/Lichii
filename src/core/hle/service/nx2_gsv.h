@@ -39,6 +39,7 @@
 #include "core/frontend/framebuffer_layout.h"
 #include "core/perf_stats.h"
 #include "video_core/gpu.h"
+#include "video_core/nx2_perf.h"
 #include "video_core/framebuffer_config.h"
 #include "core/core_timing.h"
 #include "core/hle/kernel/k_client_session.h"

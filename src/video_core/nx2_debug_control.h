@@ -3,7 +3,9 @@
 
 #pragma once
 
+#include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <filesystem>
 #include <optional>
 #include <span>
