@@ -579,8 +579,9 @@ TEST_CASE("Dual vertex programs join the descriptors and storage buffers of both
             {{}, IR::AbstractSyntaxNode::Type::Return},
         };
     }
-    const IR::Program merged{
-        Shader::Maxwell::MergeDualVertexPrograms(vertex_a.program, vertex_b.program, vertex_b.env)};
+    const Shader::HostTranslateInfo host{};
+    const IR::Program merged{Shader::Maxwell::MergeDualVertexPrograms(
+        vertex_a.program, vertex_b.program, vertex_b.env, host)};
 
     const auto& info{merged.info};
     REQUIRE(info.storage_buffers_descriptors.size() == 2);
