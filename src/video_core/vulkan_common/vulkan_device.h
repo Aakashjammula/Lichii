@@ -424,7 +424,8 @@ public:
     FN_MAX_LIMIT_ELEM(DescriptorSetStorageBuffersDynamic) \
     FN_MAX_LIMIT_ELEM(DescriptorSetSampledImages) \
     FN_MAX_LIMIT_ELEM(DescriptorSetStorageImages) \
-    FN_MAX_LIMIT_ELEM(DescriptorSetInputAttachments)
+    FN_MAX_LIMIT_ELEM(DescriptorSetInputAttachments) \
+    FN_MAX_LIMIT_ELEM(VertexOutputComponents)
 #define FN_MAX_LIMIT_ELEM(name) \
     u32 GetMax##name() const { return properties.properties.limits.max##name; }
 FN_MAX_LIMIT_LIST

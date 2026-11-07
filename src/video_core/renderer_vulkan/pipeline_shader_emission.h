@@ -26,6 +26,17 @@ inline constexpr u32 GRAPHICS_STAGE_BINDING_STRIDE = 128;
     return enabled;
 }
 
+// EDEN_NX2_GPL_FIXED_INTERFACES=1 (with EDEN_NX2_GPL_STAGE_BINDINGS=1): vertex+fragment pipelines
+// give their stages a varying interface that does not depend on the other stage, see
+// Shader::Maxwell::UseFixedStageInterface. Without stage bindings it has no effect.
+[[nodiscard]] inline bool GraphicsFixedInterfacesRequested() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_GPL_FIXED_INTERFACES");
+        return value && value[0] == '1';
+    }();
+    return enabled;
+}
+
 // Binding numbers a stage takes with unified numbering: an upper bound of what both the SPIR-V
 // emitter and the descriptor layout advance by.
 [[nodiscard]] inline u32 NumStageBindings(const Shader::Info& info) {

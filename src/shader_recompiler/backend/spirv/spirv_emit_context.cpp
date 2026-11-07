@@ -2034,8 +2034,9 @@ void EmitContext::DefineOutputs(const IR::Program& program) {
         viewport_mask = DefineOutput(*this, TypeArray(U32[1], Const(1u)), std::nullopt,
                                      spv::BuiltIn::ViewportMaskNV);
     }
+    const bool all_generics{runtime_info.declare_all_generic_outputs && stage == Stage::VertexB};
     for (size_t index = 0; index < IR::NUM_GENERICS; ++index) {
-        if (info.stores.Generic(index)) {
+        if (all_generics || info.stores.Generic(index)) {
             DefineGenericOutput(*this, index, invocations);
         }
     }

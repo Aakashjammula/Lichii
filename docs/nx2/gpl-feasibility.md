@@ -130,3 +130,47 @@ Estimated effort: steps 2-4 about two to three weeks of careful work including s
 frame-dump validation across the known games; step 5 another two to three weeks. Risk: binding
 and interface changes touch every game, so each step needs the full shader sweep and A/B frame
 dumps before it can become unconditional.
+
+## Step 2: fixed stage interfaces (`EDEN_NX2_GPL_FIXED_INTERFACES=1`)
+
+Only takes effect together with `EDEN_NX2_GPL_STAGE_BINDINGS=1` (and only in pipelines that
+keep the stage binding ranges). Unset, the emitted SPIR-V is byte-identical to before.
+
+Plain vertex+fragment pipelines (vertex A+B or B, optional fragment, no transform feedback,
+`maxVertexOutputComponents >= 128`) use `Shader::Maxwell::UseFixedStageInterface`:
+
+- The vertex stage declares all 32 generic outputs at locations 0-31. Ones it does not write
+  hold (0, 0, 0, 1), which the vertex prologue already stores into every declared output.
+  Outputs carry no interpolation decorations, as before.
+- The fragment stage declares every generic it loads, with the same locations, types and
+  `Flat`/`NoPerspective` decorations as today (they come from the fragment program alone).
+  `previous_stage_stores`, the previous stage's legacy mapping and `per_primitive_generics`
+  no longer enter it.
+- A fragment stage that loads legacy varyings (colours, fog, fixed-function texcoords) or
+  indexes its inputs keeps the linked interface: the legacy-to-generic slot comes from the
+  vertex stage's free slots, and an indexed load of an unwritten generic reads 0 in `w` today.
+
+Unwritten inputs: a fragment input the vertex stage does not write used to be a constant
+(0, 0, 0, 1); it now reads the vertex stage's default write. Flat inputs and the 0 components
+are exact. A smooth `w` is 1.0 interpolated, which is exact if the rasteriser computes
+`(1/w)/(1/w)` exactly; this is the one value to check with a frame dump.
+
+Kept on the linked path: tessellation, geometry (including layer emulation), mesh/task and
+transform-feedback pipelines. Resolution scaling > 1x still couples stages through the
+rescaling push-constant bit indices (`Bindings::texture_scaling_index`); GPL must either
+stay off while scaling is active or give each stage a fixed base in the rescaling words.
+GPL linking also needs `graphicsPipelineLibraryIndependentInterpolationDecoration` (true on
+the RTX 4060 / 615.78.08), since the vertex outputs cannot know the fragment's `Flat`.
+
+Offline check (Ocarina of Time cache, `vulkan.fork-v54.bin`, 600 vertex+fragment pipelines,
+shader-sweep `--previous-environment` / `--fixed-interfaces`): 592 compile and pass spirv-val in
+both modes (8 lack captured storage-pointer context) and all 592 fixed pairs build on the RTX
+4060 (98.8 s total vs 96.0 s linked, same p99). Each of the 330 fragment shaders emitted after
+6 random vertex shaders gave 1-6 distinct modules linked (only 13 had one) and exactly one fixed,
+except one shader with legacy or indexed loads. 8 of the 592 cache pipelines read an unwritten
+generic: 7 flat, one smooth `w`.
+
+Step 3 (state to specialization constants) still has to move out of the stage SPIR-V:
+vertex `generic_input_types`, `fixed_state_point_size`, `convert_depth_mode` and `y_negate`;
+fragment alpha test, `dual_source_blend` and `force_early_z`; and the vertex stage's
+`has_geometry` dependency (point size, depth mode) for pipelines with a geometry stage.

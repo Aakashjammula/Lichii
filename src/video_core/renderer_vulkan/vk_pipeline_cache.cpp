@@ -1387,6 +1387,16 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                     key.Hash(), GRAPHICS_STAGE_BINDING_STRIDE);
     }
 
+    // Fixed varying interfaces only for plain vertex+fragment pipelines; tessellation, geometry
+    // (including layer emulation), mesh and transform feedback keep the linked interface.
+    const bool fixed_interfaces =
+        stage_bindings && GraphicsFixedInterfacesRequested() && !key.state.xfb_enabled &&
+        infos[0] != nullptr && infos[1] == nullptr && infos[2] == nullptr &&
+        infos[3] == nullptr &&
+        programs[1].stage == Shader::Stage::VertexB &&
+        (infos[4] == nullptr || programs[5].stage == Shader::Stage::Fragment) &&
+        device.GetMaxVertexOutputComponents() >= Shader::IR::NUM_GENERICS * 4;
+
     const Shader::IR::Program* previous_stage{};
     Shader::Backend::Bindings binding;
     for (size_t stage_index = 0; stage_index < infos.size(); ++stage_index) {
@@ -1399,7 +1409,10 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             BeginGraphicsStageBindings(binding, stage_index);
         }
 
-        const auto runtime_info{MakeRuntimeInfo(programs, key, program, previous_stage, device)};
+        auto runtime_info{MakeRuntimeInfo(programs, key, program, previous_stage, device)};
+        if (fixed_interfaces) {
+            Shader::Maxwell::UseFixedStageInterface(program, runtime_info);
+        }
         ConvertLegacyToGeneric(program, runtime_info);
         if (emit_pools) {
             deferred_runtime_infos[stage_index] = runtime_info;

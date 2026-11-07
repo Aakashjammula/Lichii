@@ -89,6 +89,9 @@ struct RuntimeInfo {
     /// Fragment stage after a mesh program: generic inputs it writes per primitive.
     std::bitset<32> per_primitive_generics{};
     std::map<IR::Attribute, IR::Attribute> previous_stage_legacy_stores_mapping;
+    /// Vertex stage: declare every generic output, unwritten ones holding the default
+    /// (0, 0, 0, 1), so any fragment stage links with it (see UseFixedStageInterface).
+    bool declare_all_generic_outputs{};
 
     bool convert_depth_mode{};
     bool force_early_z{};

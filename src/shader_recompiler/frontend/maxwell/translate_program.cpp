@@ -572,6 +572,27 @@ void ConvertLegacyToGeneric(IR::Program& program, const Shader::RuntimeInfo& run
     }
 }
 
+bool UseFixedStageInterface(const IR::Program& program, RuntimeInfo& runtime_info) {
+    switch (program.stage) {
+    case Stage::VertexB:
+        runtime_info.declare_all_generic_outputs = true;
+        return true;
+    case Stage::Fragment:
+        if (program.info.loads.Legacy() || program.info.loads_indexed_attributes) {
+            return false;
+        }
+        // An undeclared input reads (0, 0, 0, 1); the vertex stage now writes that default to
+        // every generic it does not store, so declaring them all reads the same values.
+        runtime_info.previous_stage_stores = {};
+        runtime_info.previous_stage_stores.mask.set();
+        runtime_info.previous_stage_legacy_stores_mapping.clear();
+        runtime_info.per_primitive_generics.reset();
+        return true;
+    default:
+        return false;
+    }
+}
+
 IR::Program GenerateGeometryPassthrough(ObjectPool<IR::Inst>& inst_pool,
                                         ObjectPool<IR::Block>& block_pool,
                                         const HostTranslateInfo& host_info,

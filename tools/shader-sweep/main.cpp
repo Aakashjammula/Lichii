@@ -540,6 +540,8 @@ int main(int argc, char** argv) {
         bool lower_only{};
         bool packed_code{};
         bool capture_extent{};
+        bool fixed_interfaces{};
+        std::string previous_environment;
         u32 binding_base{};
         for (int i = 1; i < argc; ++i) {
             const std::string arg{argv[i]};
@@ -549,7 +551,8 @@ int main(int argc, char** argv) {
                              "  [--format instructions|native-header] [--environment FILE "
                              "--cache-version 46|47|48|49|50|51|52|53]\n"
                              "  [--pipeline-key FILE] [--capture-extent] [--binding-base N] "
-                             "(--output SPV | --lower-only WORDS | --packed-code WORDS)\n";
+                             "[--previous-environment FILE] [--fixed-interfaces]\n"
+                             "  (--output SPV | --lower-only WORDS | --packed-code WORDS)\n";
                 return 0;
             }
             if (!arg.starts_with("--")) {
@@ -560,6 +563,10 @@ int main(int argc, char** argv) {
             }
             if (arg == "--capture-extent") {
                 capture_extent = true;
+                continue;
+            }
+            if (arg == "--fixed-interfaces") {
+                fixed_interfaces = true;
                 continue;
             }
             if (++i == argc)
@@ -573,6 +580,8 @@ int main(int argc, char** argv) {
                 environment = value;
             else if (arg == "--pipeline-key")
                 pipeline_key = value;
+            else if (arg == "--previous-environment")
+                previous_environment = value;
             else if (arg == "--binding-base")
                 binding_base = static_cast<u32>(std::stoul(value));
             else if (arg == "--cache-version") {
@@ -596,7 +605,9 @@ int main(int argc, char** argv) {
         }
         if (format != "instructions" && format != "native-header")
             throw std::runtime_error("Invalid input format");
-        for (const auto& path : {input, environment, pipeline_key}) {
+        if (!previous_environment.empty() && environment.empty())
+            throw std::runtime_error("--previous-environment needs --environment");
+        for (const auto& path : {input, environment, pipeline_key, previous_environment}) {
             if (!path.empty() && std::filesystem::weakly_canonical(path) ==
                                      std::filesystem::weakly_canonical(output)) {
                 throw std::runtime_error("Output must not overwrite an input");
@@ -753,6 +764,31 @@ int main(int argc, char** argv) {
         host.support_geometry_shader_passthrough = true;
         host.ApplyDescriptorLimitPolicy();
         auto program = Shader::Maxwell::TranslateProgram(inst_pool, block_pool, env, cfg, host);
+        if (!previous_environment.empty()) {
+            // The previous pipeline stage's varyings, as MakeRuntimeInfo links them.
+            OfflineEnvironment previous_env;
+            previous_env.Load(ReadFile(previous_environment), version);
+            Shader::ObjectPool<Shader::Maxwell::Flow::Block> previous_flow_pool;
+            Shader::Maxwell::Flow::CFG previous_cfg{
+                previous_env, previous_flow_pool, Shader::Maxwell::Location{previous_env.EntryPoint()}};
+            auto previous = Shader::Maxwell::TranslateProgram(inst_pool, block_pool, previous_env,
+                                                              previous_cfg, host);
+            Json previous_assumptions = Json::array();
+            Shader::Maxwell::ConvertLegacyToGeneric(
+                previous, Runtime(key, previous_env.ShaderStage(), previous_assumptions));
+            runtime.previous_stage_stores = previous.info.stores;
+            runtime.previous_stage_legacy_stores_mapping = previous.info.legacy_stores_mapping;
+            u32 unwritten{};
+            for (size_t index = 0; index < Shader::IR::NUM_GENERICS; ++index) {
+                unwritten += program.info.loads.Generic(index) && !previous.info.stores.Generic(index);
+            }
+            diagnostic["unwritten_generic_inputs"] = unwritten;
+            diagnostic["assumptions"].push_back(
+                "Previous-stage varyings come from --previous-environment instead");
+        }
+        if (fixed_interfaces) {
+            diagnostic["fixed_interface"] = Shader::Maxwell::UseFixedStageInterface(program, runtime);
+        }
         Shader::Maxwell::ConvertLegacyToGeneric(program, runtime);
         diagnostic["phase"] = "spirv";
         Shader::Profile profile{};
