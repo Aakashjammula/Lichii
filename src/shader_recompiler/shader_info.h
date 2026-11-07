@@ -236,6 +236,9 @@ struct TextureDescriptor {
     /// program computes the handle of each element (HandleOp::Index): a handle the shader reads
     /// from a table at an index only each invocation knows, the shader indexing the array.
     u32 handle_program{~0U};
+    /// Whether the shader indexes the descriptor: an array, whose count the descriptor limits set
+    /// (LimitSampledTextureArrays). It stays one when they cut it to a single element.
+    bool is_descriptor_array{};
 
     auto operator<=>(const TextureDescriptor&) const = default;
 };

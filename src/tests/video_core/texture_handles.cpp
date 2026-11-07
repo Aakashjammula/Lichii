@@ -241,12 +241,17 @@ TEST_CASE("Texture arrays reserve the final static and buffer resources",
         shader.Run();
         auto& info = shader.program.info;
         const auto descriptor = info.texture_descriptors.front();
+        // Other textures: descriptors equal to one another would be one after a cut.
         for (u32 i = 1; i < arrays; ++i) {
-            info.texture_descriptors.push_back(descriptor);
+            auto other = descriptor;
+            other.cbuf_offset = 0x100 * i;
+            info.texture_descriptors.push_back(other);
         }
         for (u32 i = 0; i < 3; ++i) {
             auto fixed = descriptor;
             fixed.count = 1;
+            fixed.is_descriptor_array = false;
+            fixed.cbuf_offset = 0x400 + 8 * i;
             info.texture_descriptors.push_back(fixed);
         }
         for (u32 i = 0; i < 5; ++i) {
@@ -307,10 +312,13 @@ TEST_CASE("Texture arrays fit the sampler limits of their stage and pipeline",
     CHECK(samples[0]->Arg(0).InstRecursive()->Arg(1).U32() == 7);
 
     // The descriptor set limits count the textures of both stages.
-    auto fixed = second.texture_descriptors.front();
-    fixed.count = 1;
-    second.texture_descriptors.push_back(fixed);
-    second.texture_descriptors.push_back(fixed);
+    for (const u32 offset : {0x100U, 0x108U}) {
+        auto fixed = second.texture_descriptors.front();
+        fixed.count = 1;
+        fixed.is_descriptor_array = false;
+        fixed.cbuf_offset = offset;
+        second.texture_descriptors.push_back(fixed);
+    }
     host.max_descriptor_set_samplers = 20;
     const std::array programs{&stages[0].program, &stages[1].program};
     Shader::Optimization::LimitPipelineSampledTextureArrays(programs, host);
@@ -321,6 +329,74 @@ TEST_CASE("Texture arrays fit the sampler limits of their stage and pipeline",
 
     host.max_descriptor_set_samplers = 3;
     REQUIRE_THROWS(Shader::Optimization::LimitPipelineSampledTextureArrays(programs, host));
+}
+
+TEST_CASE("Texture arrays a cap cut to one element still count as arrays",
+          "[video_core][texture_handles]") {
+    // With one sampler a stage, the pass cuts the array to one element before it has the other
+    // textures of the stage. The limits of the stage and of the pipeline still count it.
+    Shader::HostTranslateInfo host;
+    host.ApplyDescriptorLimitPolicy();
+    host.max_per_stage_descriptor_samplers = 1;
+    std::array<HandleProgram, 2> stages;
+    HandleProgram& shader{stages[0]};
+    const Value offset{shader.Emit(Opcode::ShiftLeftLogical32, {shader.Storage(0), Value{4U}})};
+    auto& sample{shader.Sample(shader.Emit(Opcode::GetCbufU32, {Value{0U}, offset}))};
+    Shader::Optimization::TexturePass(shader.env, shader.program, host);
+    auto& info{shader.program.info};
+    REQUIRE(info.texture_descriptors.size() == 1);
+    const auto array{info.texture_descriptors.front()};
+    CHECK(array.count == 1);
+    CHECK(array.is_descriptor_array);
+    CHECK(sample.Arg(0).IsEmpty());
+    CHECK_NOTHROW(Shader::Optimization::LimitSampledTextureArrays(shader.program, host));
+
+    // With a texture of another stage, the pipeline exceeds a set of one sampler.
+    auto single{array};
+    single.is_descriptor_array = false;
+    single.cbuf_offset = 0x100;
+    stages[1].program.info.texture_descriptors.push_back(single);
+    host.max_descriptor_set_samplers = 1;
+    const std::array programs{&stages[0].program, &stages[1].program};
+    REQUIRE_THROWS(Shader::Optimization::LimitPipelineSampledTextureArrays(programs, host));
+
+    // With one of its own, the stage exceeds its limit.
+    info.texture_descriptors.push_back(single);
+    REQUIRE_THROWS(Shader::Optimization::LimitSampledTextureArrays(shader.program, host));
+    // A stage reading its textures on their own is left as the guest has it.
+    info.texture_descriptors.front().is_descriptor_array = false;
+    CHECK_NOTHROW(Shader::Optimization::LimitSampledTextureArrays(shader.program, host));
+}
+
+TEST_CASE("Texture descriptors a cap makes equal share one binding",
+          "[video_core][texture_handles]") {
+    // An array of the textures at c0[0] and the texture at c0[0] read on its own: cut to one
+    // element, the array is that texture.
+    HandleProgram shader;
+    const Value offset{shader.Emit(Opcode::ShiftLeftLogical32, {shader.Storage(0), Value{4U}})};
+    auto& indexed{shader.Sample(shader.Emit(Opcode::GetCbufU32, {Value{0U}, offset}))};
+    auto& single{shader.Sample(shader.Emit(Opcode::GetCbufU32, {Value{0U}, Value{0U}}))};
+    shader.Run();
+    auto& info{shader.program.info};
+    REQUIRE(info.texture_descriptors.size() == 2);
+    REQUIRE(info.texture_descriptors[0].size_shift != info.texture_descriptors[1].size_shift);
+    // The rescaling pass's test of the second descriptor.
+    auto& scaled{*shader.Emit(Opcode::IsTextureScaled, {Value{1U}}).Inst()};
+
+    Shader::HostTranslateInfo host;
+    host.ApplyDescriptorLimitPolicy();
+    host.max_per_stage_descriptor_samplers = 1;
+    Shader::Optimization::LimitSampledTextureArrays(shader.program, host);
+    REQUIRE(info.texture_descriptors.size() == 1);
+    CHECK(info.texture_descriptors[0].count == 1);
+    CHECK(info.texture_descriptors[0].is_descriptor_array);
+    const auto index = [](const IR::Inst& inst) -> u32 {
+        return inst.Flags<IR::TextureInstInfo>().descriptor_index;
+    };
+    CHECK(index(indexed) == 0);
+    CHECK(index(single) == 0);
+    CHECK(indexed.Arg(0).IsEmpty());
+    CHECK(scaled.Arg(0).U32() == 0);
 }
 
 TEST_CASE("Failed Phi handle subtrees discard their cached values",

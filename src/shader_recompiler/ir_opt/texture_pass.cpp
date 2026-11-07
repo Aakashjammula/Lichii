@@ -126,10 +126,19 @@ u32 SaturatingSub(u32 lhs, u32 rhs) {
     return lhs > rhs ? lhs - rhs : 0;
 }
 
+// Whether a descriptor is an array, which the descriptor limits shrink. A texture the shader
+// indexes stays one when they leave it a single element.
+[[nodiscard]] bool IsDescriptorArray(const TextureBufferDescriptor& desc) noexcept {
+    return desc.count > 1;
+}
+[[nodiscard]] bool IsDescriptorArray(const TextureDescriptor& desc) noexcept {
+    return desc.count > 1 || desc.is_descriptor_array;
+}
+
 template <typename T>
 [[nodiscard]] u32 StaticDescriptorCount(T const& descriptors) noexcept {
     return std::accumulate(descriptors.cbegin(), descriptors.cend(), 0U, [](auto const& acc, auto const& e) {
-        return acc + (e.count <= 1 ? e.count : 0);
+        return acc + (IsDescriptorArray(e) ? 0 : e.count);
     });
 }
 
@@ -177,15 +186,25 @@ bool IsSampledImageOpcode(IR::Opcode opcode) {
     }
 }
 
+void MergeTextureDescriptors(IR::Program& program);
+
 // Shrinks the texture arrays of a program to at most cap elements, clamping the element index of
-// every instruction that reads an array it shrank.
+// every instruction that reads an array it shrank, and merges the descriptors that the cut makes
+// equal.
 void CapTextureArrays(IR::Program& program, u32 cap) {
     auto& descriptors = program.info.texture_descriptors;
     boost::container::small_vector<bool, 16> shrunk(descriptors.size());
+    bool any_shrunk{};
     for (size_t index = 0; index < descriptors.size(); ++index) {
         if (descriptors[index].count > cap) {
             descriptors[index].count = cap;
+            if (cap == 1) {
+                // One element has no stride: it takes a single texture's, which makes the array
+                // equal to a descriptor of its texture the shader reads on its own.
+                descriptors[index].size_shift = DESCRIPTOR_SIZE_SHIFT;
+            }
             shrunk[index] = true;
+            any_shrunk = true;
         }
     }
     for (IR::Block* const block : program.post_order_blocks) {
@@ -207,6 +226,9 @@ void CapTextureArrays(IR::Program& program, u32 cap) {
             inst.SetArg(0, ir.UMin(IR::U32{inst.Arg(0)}, ir.Imm32(count - 1)));
         }
     }
+    if (any_shrunk) {
+        MergeTextureDescriptors(program);
+    }
 }
 
 // The textures of a pipeline's stages. Each is a combined image sampler, which the descriptor set
@@ -222,7 +244,7 @@ struct PipelineTextures {
         for (const IR::Program* const program : programs) {
             for (const auto& desc : program->info.texture_descriptors) {
                 samplers += desc.count;
-                if (desc.count > 1) {
+                if (IsDescriptorArray(desc)) {
                     ++arrays;
                 } else {
                     fixed_samplers += desc.count;
@@ -1428,6 +1450,7 @@ public:
         // TODO: Read this from TIC
         texture_descriptors[index].is_multisample |= desc.is_multisample;
         texture_descriptors[index].is_integer |= desc.is_integer;
+        texture_descriptors[index].is_descriptor_array |= desc.is_descriptor_array;
         return index;
     }
 
@@ -1463,6 +1486,26 @@ private:
     TextureDescriptors& texture_descriptors;
     ImageDescriptors& image_descriptors;
 };
+
+// Keeps one of the texture descriptors that bind the same textures, as the pass adds them: a cut
+// can leave an array with the elements of another descriptor of its texture, or with the single
+// texture a descriptor of its own reads. Points the instructions at the descriptors kept.
+void MergeTextureDescriptors(IR::Program& program) {
+    Info& info{program.info};
+    TextureDescriptors merged;
+    Descriptors descriptors{info.texture_buffer_descriptors, info.image_buffer_descriptors, merged,
+                            info.image_descriptors};
+    JoinedDescriptors indices;
+    indices.textures.reserve(info.texture_descriptors.size());
+    for (const TextureDescriptor& desc : info.texture_descriptors) {
+        indices.textures.push_back(descriptors.Add(desc));
+    }
+    if (merged.size() == info.texture_descriptors.size()) {
+        return;
+    }
+    info.texture_descriptors = std::move(merged);
+    RemapTextureDescriptors(program, indices);
+}
 
 // Expects the sample's descriptor to be assigned: the size query reads the same texture (and
 // the same element of a descriptor array).
@@ -1775,8 +1818,10 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
                     .secondary_cbuf_offset = cbuf.secondary_offset,
                     .secondary_shift_left = cbuf.secondary_shift_left,
                     .count = count,
-                    .size_shift = size_shift,
+                    // One element has no stride (see CapTextureArrays).
+                    .size_shift = count > 1 ? size_shift : DESCRIPTOR_SIZE_SHIFT,
                     .handle_program = cbuf.handle_program,
+                    .is_descriptor_array = cbuf.count > 1,
                 });
                 flags.is_integer.Assign(is_integer ? 1 : 0);
             }
@@ -1811,8 +1856,10 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
 
 void LimitSampledTextureArrays(IR::Program& program, const HostTranslateInfo& host_info) {
     auto& info = program.info;
+    // Arrays a cap (the pass's, or this one's for a half of a joined stage) has cut to a single
+    // element count too: the stage must still fit with them.
     const u32 arrays = static_cast<u32>(std::ranges::count_if(
-        info.texture_descriptors, [](const auto& desc) { return desc.count > 1; }));
+        info.texture_descriptors, [](const auto& desc) { return IsDescriptorArray(desc); }));
     if (arrays == 0) {
         return;
     }
