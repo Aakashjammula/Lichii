@@ -57,8 +57,6 @@ struct KernelProgram {
     bool int64{true};
     u32 storage_buffer_limit{};     ///< The stage's storage buffer limit, none when 0
     u32 set_storage_buffer_limit{}; ///< The descriptor set's storage buffer limit, none when 0
-}
-
     bool compact{};
 
     KernelProgram() {
@@ -73,8 +71,6 @@ struct KernelProgram {
         host.support_int64 = int64;
         host.max_per_stage_descriptor_storage_buffers = storage_buffer_limit;
         host.max_descriptor_set_storage_buffers = set_storage_buffer_limit;
-}
-
         host.compact_global_loads = compact;
         Shader::Optimization::GlobalMemoryToStorageBufferPass(env, program, host);
         std::vector<u32> offsets;
