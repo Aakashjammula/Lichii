@@ -393,7 +393,18 @@ Tegra::Texture::TICEntry GenericEnvironment::ReadTextureInfo(GPUVAddr tic_addr, 
     ASSERT(index <= tic_limit);
     const GPUVAddr descriptor_addr{tic_addr + index * sizeof(Tegra::Texture::TICEntry)};
     Tegra::Texture::TICEntry entry;
-    gpu_memory->ReadBlock(descriptor_addr, &entry, sizeof(entry));
+    // EDEN_NX2_UNSAFE_TIC_READ=1: read unsafe, as the texture cache's DescriptorTable does. A
+    // flushing read of a GPU-written table waited for a download and stalled a translation on
+    // the GPU thread for up to 2.2 s (Keeflo541/Zeus 93d882d483).
+    static const bool unsafe_tic_read = [] {
+        const char* value = std::getenv("EDEN_NX2_UNSAFE_TIC_READ");
+        return value != nullptr && value[0] == '1';
+    }();
+    if (unsafe_tic_read) {
+        gpu_memory->ReadBlockUnsafe(descriptor_addr, &entry, sizeof(entry));
+    } else {
+        gpu_memory->ReadBlock(descriptor_addr, &entry, sizeof(entry));
+    }
     if (entry.format.Value() == Tegra::Texture::TextureFormat{} &&
         std::getenv("EDEN_NX2_RENDER_TRACE")) {
         static std::atomic<u32> traces{};
