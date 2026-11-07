@@ -300,7 +300,9 @@ void DefineEntryPoint(const IR::Program& program, EmitContext& ctx, Id main) {
         ctx.AddExecutionMode(main, spv::ExecutionMode::OutputVertices, program.mesh.max_vertices);
         ctx.AddExecutionMode(main, spv::ExecutionMode::OutputPrimitivesEXT,
                              program.mesh.max_primitives);
-        ctx.AddExecutionMode(main, spv::ExecutionMode::OutputTrianglesEXT);
+        ctx.AddExecutionMode(main, program.mesh.topology == 0   ? spv::ExecutionMode::OutputPoints
+                                   : program.mesh.topology == 1 ? spv::ExecutionMode::OutputLinesEXT
+                                                                : spv::ExecutionMode::OutputTrianglesEXT);
         break;
     case Stage::TessellationControl:
         execution_model = spv::ExecutionModel::TessellationControl;
@@ -660,6 +662,10 @@ std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_in
     std::vector<u32> code{ctx.Assemble()};
     RewriteOpcodes(code, ctx.opcode_rewrites);
     PatchMeshInstructions(code, ctx);
+    if (ctx.cooperative_hmma) {
+        PatchCooperativeHmma(code, *ctx.cooperative_hmma);
+    }
+    program.info.uses_cooperative_matrix = ctx.cooperative_hmma.has_value();
     return code;
 }
 

@@ -763,6 +763,15 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
                                VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME);
     }
 
+    // The float16 workarounds above keep shaders from doing float16 arithmetic. Cooperative
+    // matrices only pass 16-bit floats to the tensor cores and back, so they keep the device
+    // feature, which no other shader then uses.
+    float16_math = features.shader_float16_int8.shaderFloat16;
+    if (extensions.cooperative_matrix) {
+        features.shader_float16_int8.shaderFloat16 = VK_TRUE;
+        LOG_INFO(Render_Vulkan, "VK_KHR_cooperative_matrix enabled for guest tensor operations");
+    }
+
     logical = vk::Device::Create(physical, queue_cis, ExtensionListForVulkan(loaded_extensions), first_next, dld);
 
     graphics_queue = logical.GetQueue(graphics_family);
@@ -985,9 +994,78 @@ VkFormat Device::GetSupportedFormat(VkFormat wanted_format, VkFormatFeatureFlags
 
 void Device::ReportLoss() const {
     LOG_CRITICAL(Render_Vulkan, "Device loss occurred!");
+    ReportDeviceFault();
 
     // Wait for the log to flush and for Nsight Aftermath to dump the results
     std::this_thread::sleep_for(std::chrono::seconds{15});
+}
+
+void Device::ReportDeviceFault() const {
+    if (!device_fault_features.deviceFault || !dld.vkGetDeviceFaultInfoEXT) {
+        LOG_CRITICAL(Render_Vulkan, "Device fault info: not supported by the driver");
+        return;
+    }
+    VkDeviceFaultCountsEXT counts{.sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT};
+    VkResult result = dld.vkGetDeviceFaultInfoEXT(*logical, &counts, nullptr);
+    if (result != VK_SUCCESS) {
+        LOG_CRITICAL(Render_Vulkan, "Device fault info: query failed ({})",
+                     static_cast<int>(result));
+        return;
+    }
+    std::vector<VkDeviceFaultAddressInfoEXT> addresses(counts.addressInfoCount);
+    std::vector<VkDeviceFaultVendorInfoEXT> vendor_infos(counts.vendorInfoCount);
+    counts.vendorBinarySize = 0;
+    VkDeviceFaultInfoEXT info{
+        .sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT,
+        .pAddressInfos = addresses.data(),
+        .pVendorInfos = vendor_infos.data(),
+    };
+    result = dld.vkGetDeviceFaultInfoEXT(*logical, &counts, &info);
+    if (result != VK_SUCCESS && result != VK_INCOMPLETE) {
+        LOG_CRITICAL(Render_Vulkan, "Device fault info: query failed ({})",
+                     static_cast<int>(result));
+        return;
+    }
+    LOG_CRITICAL(Render_Vulkan, "Device fault: {} ({} addresses, {} vendor records)",
+                 info.description, counts.addressInfoCount, counts.vendorInfoCount);
+    for (u32 i = 0; i < counts.addressInfoCount; ++i) {
+        const VkDeviceFaultAddressInfoEXT& address = addresses[i];
+        const char* type = "unknown";
+        switch (address.addressType) {
+        case VK_DEVICE_FAULT_ADDRESS_TYPE_NONE_EXT:
+            type = "none";
+            break;
+        case VK_DEVICE_FAULT_ADDRESS_TYPE_READ_INVALID_EXT:
+            type = "invalid read";
+            break;
+        case VK_DEVICE_FAULT_ADDRESS_TYPE_WRITE_INVALID_EXT:
+            type = "invalid write";
+            break;
+        case VK_DEVICE_FAULT_ADDRESS_TYPE_EXECUTE_INVALID_EXT:
+            type = "invalid execute";
+            break;
+        case VK_DEVICE_FAULT_ADDRESS_TYPE_INSTRUCTION_POINTER_UNKNOWN_EXT:
+            type = "instruction pointer (unknown)";
+            break;
+        case VK_DEVICE_FAULT_ADDRESS_TYPE_INSTRUCTION_POINTER_INVALID_EXT:
+            type = "instruction pointer (invalid)";
+            break;
+        case VK_DEVICE_FAULT_ADDRESS_TYPE_INSTRUCTION_POINTER_FAULT_EXT:
+            type = "instruction pointer (fault)";
+            break;
+        default:
+            break;
+        }
+        const VkDeviceSize precision = (std::max)(address.addressPrecision, VkDeviceSize{1});
+        const VkDeviceSize lower = address.reportedAddress & ~(precision - 1);
+        LOG_CRITICAL(Render_Vulkan, "Device fault address {}: {} at {:#x} (range [{:#x}, {:#x}))",
+                     i, type, address.reportedAddress, lower, lower + precision);
+    }
+    for (u32 i = 0; i < counts.vendorInfoCount; ++i) {
+        const VkDeviceFaultVendorInfoEXT& vendor = vendor_infos[i];
+        LOG_CRITICAL(Render_Vulkan, "Device fault vendor record {}: {} (code {:#x}, data {:#x})", i,
+                     vendor.description, vendor.vendorFaultCode, vendor.vendorFaultData);
+    }
 }
 
 void Device::SaveShader(std::span<const u32> spirv) const {
@@ -1247,8 +1325,21 @@ bool Device::GetSuitability(bool requires_swapchain) {
 #undef EXT_FEATURE
 #undef FEATURE
 
+    // VK_EXT_device_fault: what the driver knows about a device loss (ReportLoss).
+    const bool has_device_fault_extension =
+        supported_extensions.contains(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+    if (has_device_fault_extension) {
+        device_fault_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT;
+        SetNext(next, device_fault_features);
+    }
+
     // Perform the feature test.
     physical.GetFeatures2(features2);
+
+    if (has_device_fault_extension) {
+        loaded_extensions.insert(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+        device_fault_features.deviceFaultVendorBinary = VK_FALSE;
+    }
 
     // Base Vulkan 1.0 features are always valid regardless of instance version.
     features.features = features2.features;
@@ -1337,6 +1428,11 @@ bool Device::GetSuitability(bool requires_swapchain) {
         properties.custom_border_color.sType =
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_PROPERTIES_EXT;
         SetNext(next, properties.custom_border_color);
+    }
+    if (extensions.cooperative_matrix) {
+        properties.cooperative_matrix.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_PROPERTIES_KHR;
+        SetNext(next, properties.cooperative_matrix);
     }
 
     // Perform the property fetch.
@@ -1626,6 +1722,45 @@ void Device::RemoveUnsuitableExtensions() {
                                      extensions.shader_maximal_reconvergence;
     RemoveExtensionFeatureIfUnsuitable(extensions.shader_quad_control, features.shader_quad_control,
                                        VK_KHR_SHADER_QUAD_CONTROL_EXTENSION_NAME);
+
+    // VK_KHR_cooperative_matrix
+    // Used only for the guest's HMMA.16816.F16: the same M=16 N=8 K=16 shape with 16-bit floats
+    // in every matrix, as a subgroup operation of compute shaders whose subgroups are the guest's
+    // 32-lane warp. The matrices hold 16-bit floats, so the device needs shaderFloat16. Shaders
+    // with them use the Vulkan memory model and run with full subgroups.
+    {
+        const bool has_shape = std::ranges::any_of(
+            physical.GetCooperativeMatrixPropertiesKHR(),
+            [](const VkCooperativeMatrixPropertiesKHR& shape) {
+                return shape.MSize == 16 && shape.NSize == 8 && shape.KSize == 16 &&
+                       shape.AType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+                       shape.BType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+                       shape.CType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+                       shape.ResultType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+                       shape.saturatingAccumulation == VK_FALSE &&
+                       shape.scope == VK_SCOPE_SUBGROUP_KHR;
+            });
+        extensions.cooperative_matrix =
+            extensions.cooperative_matrix && features.cooperative_matrix.cooperativeMatrix &&
+            has_shape &&
+            (properties.cooperative_matrix.cooperativeMatrixSupportedStages &
+             VK_SHADER_STAGE_COMPUTE_BIT) != 0 &&
+            (properties.subgroup_properties.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT) != 0 &&
+            properties.subgroup_properties.subgroupSize == GuestWarpSize &&
+            // Compute subgroups may vary between these sizes (always with SPIR-V 1.6), and the
+            // per-lane matrix layout needs exactly the guest's 32 lanes.
+            extensions.subgroup_size_control &&
+            properties.subgroup_size_control.minSubgroupSize == GuestWarpSize &&
+            properties.subgroup_size_control.maxSubgroupSize == GuestWarpSize &&
+            features.subgroup_size_control.computeFullSubgroups &&
+            features.vulkan_memory_model.vulkanMemoryModel &&
+            features.vulkan_memory_model.vulkanMemoryModelDeviceScope &&
+            features.shader_float16_int8.shaderFloat16;
+        features.cooperative_matrix.cooperativeMatrixRobustBufferAccess = VK_FALSE;
+        RemoveExtensionFeatureIfUnsuitable(extensions.cooperative_matrix,
+                                           features.cooperative_matrix,
+                                           VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
+    }
 
     // VK_KHR_workgroup_memory_explicit_layout
     extensions.workgroup_memory_explicit_layout =

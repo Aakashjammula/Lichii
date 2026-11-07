@@ -168,6 +168,7 @@ add_library(video_core STATIC
     renderer_vulkan/fixed_pipeline_state.cpp
     renderer_vulkan/fixed_pipeline_state.h
     renderer_vulkan/framebuffer_clear_layers.h
+    renderer_vulkan/framebuffer_limits.h
     renderer_vulkan/maxwell_to_vk.cpp
     renderer_vulkan/maxwell_to_vk.h
     renderer_vulkan/pipeline_build.h
@@ -194,6 +195,8 @@ add_library(video_core STATIC
     renderer_vulkan/vk_dlss_network_probe.h
     renderer_vulkan/vk_compute_pipeline.cpp
     renderer_vulkan/vk_compute_pipeline.h
+    renderer_vulkan/vk_cooperative_hmma_test.cpp
+    renderer_vulkan/vk_cooperative_hmma_test.h
     renderer_vulkan/vk_descriptor_buffer.cpp
     renderer_vulkan/vk_descriptor_buffer.h
     renderer_vulkan/vk_descriptor_pool.cpp
@@ -241,6 +244,7 @@ add_library(video_core STATIC
     renderer_vulkan/vk_turbo_mode.h
     renderer_vulkan/vk_update_descriptor.cpp
     renderer_vulkan/vk_update_descriptor.h
+    renderer_vulkan/descriptor_payload_growth.h
     vulkan_common/vulkan_debug_callback.cpp
     vulkan_common/vulkan_debug_callback.h
     vulkan_common/vulkan_device.cpp
@@ -249,6 +253,7 @@ add_library(video_core STATIC
     vulkan_common/vulkan_instance.h
     vulkan_common/vulkan_library.cpp
     vulkan_common/vulkan_library.h
+    vulkan_common/vulkan_overlay_filter.h
     vulkan_common/vulkan_memory_allocator.cpp
     vulkan_common/vulkan_memory_allocator.h
     vulkan_common/vulkan_surface.cpp
@@ -453,6 +458,9 @@ if (ENABLE_OPENGL)
 endif()
 
 target_link_libraries(video_core PUBLIC common core)
+if(WIN32)
+    target_link_libraries(video_core PRIVATE advapi32)
+endif()
 target_link_libraries(video_core PUBLIC shader_recompiler stb bc_decoder gpu_logging)
 if (ENABLE_OPENGL)
     target_link_libraries(video_core PUBLIC glad)

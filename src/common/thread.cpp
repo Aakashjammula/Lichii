@@ -618,6 +618,58 @@ void SelectCurrentThreadCpuSets(const std::vector<ULONG>& ids) {
 } // Anonymous namespace
 #endif
 
+#if defined(__linux__) && !defined(__ANDROID__)
+#include <fstream>
+#include <optional>
+
+namespace {
+// The logical processors this process may run on, with their physical core (package and core id)
+// and, on hybrid CPUs that report it, their relative capacity as the efficiency class.
+std::vector<Common::LogicalProcessor> LinuxProcessors() {
+    std::vector<Common::LogicalProcessor> processors;
+    cpu_set_t allowed;
+    CPU_ZERO(&allowed);
+    if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0) {
+        return processors;
+    }
+    const auto read = [](int cpu, const char* node) -> std::optional<u32> {
+        std::ifstream file{"/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/" + node};
+        u32 value{};
+        if (file >> value) {
+            return value;
+        }
+        return std::nullopt;
+    };
+    for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+        if (!CPU_ISSET(cpu, &allowed)) {
+            continue;
+        }
+        const auto core = read(cpu, "topology/core_id");
+        const auto package = read(cpu, "topology/physical_package_id");
+        if (!core || !package) {
+            return {};
+        }
+        // cpu_capacity is 1024 for the fastest cores; absent on CPUs that are not hybrid.
+        const u32 capacity = read(cpu, "cpu_capacity").value_or(1024);
+        processors.push_back({static_cast<u32>(cpu), (*package << 16) | *core,
+                              static_cast<u8>((std::min)(capacity, 1024U) >> 3)});
+    }
+    return processors;
+}
+
+void SetCurrentThreadAffinity(const std::vector<u32>& cpus) {
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    for (const u32 cpu : cpus) {
+        CPU_SET(cpu, &set);
+    }
+    if (const int error = pthread_setaffinity_np(pthread_self(), sizeof(set), &set); error != 0) {
+        LOG_WARNING(Common, "pthread_setaffinity_np failed: {}", std::strerror(error));
+    }
+}
+} // Anonymous namespace
+#endif
+
 namespace Common {
 
 std::vector<u32> ParseCpuList(std::string_view list) {
@@ -801,65 +853,30 @@ void PinCurrentThread(PinnedRole role) {
         SelectCurrentThreadCpuSets(ids);
     }
 #elif defined(__linux__) && !defined(__ANDROID__)
-    // The Windows plan on Linux: SMT siblings from sysfs, the P-cores from cpu_core when hybrid.
-    struct PinnedMasks {
-        cpu_set_t front{};
-        cpu_set_t back{};
-        cpu_set_t guest{};
-        bool valid = false;
-    };
-    static const PinnedMasks pinned = [] {
-        PinnedMasks result;
-        cpu_set_t allowed{};
-        if (sched_getaffinity(getpid(), sizeof(allowed), &allowed) != 0) {
-            return result;
-        }
-        cpu_set_t performance{};
-        const bool hybrid = ReadCpuSet("/sys/devices/cpu_core/cpus", allowed, performance);
-        std::vector<LogicalProcessor> processors;
-        for (u32 cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
-            if (!CPU_ISSET(cpu, &allowed)) {
-                continue;
-            }
-            std::ifstream file("/sys/devices/system/cpu/cpu" + std::to_string(cpu) +
-                               "/topology/thread_siblings_list");
-            std::string list;
-            const auto siblings = file && std::getline(file, list) ? Common::ParseCpuList(list)
-                                                                    : std::vector<u32>{};
-            const u32 core = siblings.empty() ? cpu : *std::ranges::min_element(siblings);
-            const u8 efficiency_class = !hybrid || CPU_ISSET(cpu, &performance) ? 1 : 0;
-            processors.push_back({cpu, core, efficiency_class});
-        }
-        const GpuThreadPinning plan = PlanGpuThreadPinning(processors);
-        if (plan.front.empty()) {
+    static const GpuThreadPinning plan = [] {
+        GpuThreadPinning result = PlanGpuThreadPinning(LinuxProcessors());
+        if (result.front.empty()) {
             LOG_WARNING(Common,
                         "GPU thread pinning skipped: {} physical performance cores, needs {}",
-                        plan.performance_cores, MinCoresForGpuThreadPinning);
-            return result;
+                        result.performance_cores, MinCoresForGpuThreadPinning);
+        } else {
+            LOG_INFO(Common,
+                     "GPU thread pinning: front and back on a physical core each, guest cores on "
+                     "the other {} performance cores ({} logical processors)",
+                     result.performance_cores - 2, result.guest.size());
         }
-        for (const auto& [ids, mask] : {std::pair{&plan.front, &result.front},
-                                        std::pair{&plan.back, &result.back},
-                                        std::pair{&plan.guest, &result.guest}}) {
-            for (const u32 id : *ids) {
-                CPU_SET(id, mask);
-            }
-        }
-        result.valid = true;
-        LOG_INFO(Common,
-                 "GPU thread pinning: front and back on a physical core each, guest cores on the "
-                 "other {} performance cores ({} logical processors)",
-                 plan.performance_cores - 2, plan.guest.size());
         return result;
     }();
-    if (pinned.valid) {
-        SetLinuxAffinity(role == PinnedRole::GpuFront  ? pinned.front
-                         : role == PinnedRole::GpuBack ? pinned.back
-                                                       : pinned.guest);
+    const std::vector<u32>& cpus = role == PinnedRole::GpuFront  ? plan.front
+                                   : role == PinnedRole::GpuBack ? plan.back
+                                                                 : plan.guest;
+    if (!cpus.empty()) {
+        SetCurrentThreadAffinity(cpus);
     }
 #else
     (void)role;
     [[maybe_unused]] static const bool logged = [] {
-        LOG_INFO(Common, "GPU thread pinning is not supported on this platform");
+        LOG_INFO(Common, "GPU thread pinning is only supported on Windows and Linux");
         return true;
     }();
 #endif
