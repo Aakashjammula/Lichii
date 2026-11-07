@@ -3415,6 +3415,11 @@ private:
     /// known (a fence release's payload); nullptr otherwise.
     const u32* FrontReportData(const FrontState& state, u32 method, u64 bytes) const;
     void FrontNoteReportPages(VideoCommon::GpuSplit& split, GPUVAddr begin, GPUVAddr end) const;
+    /// EDEN_NX2_OCCLUSION_READ_WAIT: a report is about to be forwarded to the back: counts it in
+    /// the pending-report filter. Returns whether a macro DMA read found a report pending on its
+    /// block before.
+    bool FrontIssueReport(FrontState& state, u32 query_word);
+    void FrontSubmitReports(VideoCommon::GpuSplit& split);
     /// EDEN_NX2_DMA_READ_CHECK: compares a front report read with a drained one (keeps the latter).
     bool FrontCheckReportRead(VideoCommon::GpuSplit& split, u32 macro, GPUVAddr source,
                               std::vector<u32>& words);

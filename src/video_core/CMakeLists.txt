@@ -132,6 +132,7 @@ add_library(video_core STATIC
     query_cache.h
     query_dma.h
     rasterizer_interface.h
+    report_filter.h
     renderer_base.cpp
     renderer_base.h
 
