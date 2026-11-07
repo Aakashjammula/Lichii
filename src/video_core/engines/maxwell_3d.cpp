@@ -1174,7 +1174,7 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
         return;
     }
     // EDEN_NX2_FAST_DRAIN: what a constant buffer upload word or a report writes.
-    const auto [write_begin, write_end] = FrontWriteRange(fs, method, 1);
+    const auto [write_begin, write_end] = FrontWriteRange(fs, method, 1, value);
     if (!execution_mask[method]) {
         // Nothing would change on the back: CallMethod and ConsumeSinkImpl skip same-value state
         // writes, and the shadow RAM (tracked by default) holds the value already.
@@ -1231,15 +1231,17 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
         constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
         const bool upload = method >= cb_data && method < cb_data + 16 &&
                             fs.control != Regs::ShadowRamControl::Replay;
-        split.RangeLastWrite(memory_manager, write_begin, write_end, upload ? &value : nullptr);
+        const u32* const data = upload ? &value : FrontReportData(fs, method, write_end - write_begin);
+        split.RangeLastWrite(memory_manager, write_begin, write_end, data);
         if (method == MAXWELL3D_REG_INDEX(report_semaphore.query)) {
             FrontNoteRelease(split, fs, value);
+            FrontNoteReportPages(split, write_begin, write_end);
         }
     }
 }
 
 std::pair<GPUVAddr, GPUVAddr> Maxwell3D::FrontWriteRange(const FrontState& fs, u32 method,
-                                                         u32 amount) const {
+                                                         u32 amount, u32 first_word) const {
     if (!VideoCommon::GpuSplit::FastDrain()) {
         return {0, 0};
     }
@@ -1264,9 +1266,40 @@ std::pair<GPUVAddr, GPUVAddr> Maxwell3D::FrontWriteRange(const FrontState& fs, u
         const GPUVAddr begin =
             (GPUVAddr{fs.regs[MAXWELL3D_REG_INDEX(report_semaphore.address_high)]} << 32) |
             fs.regs[MAXWELL3D_REG_INDEX(report_semaphore.address_low)];
+        // EDEN_NX2_FRONT_REPORT_READS: a short payload release (a fence) writes its payload only.
+        if (VideoCommon::GpuSplit::FrontReportReads() && FrontIsFenceRelease(first_word)) {
+            return {begin, begin + sizeof(u32)};
+        }
         return {begin, begin + 16};
     }
     return {0, 0};
+}
+
+bool Maxwell3D::FrontIsFenceRelease(u32 query) {
+    Regs::ReportSemaphore report{};
+    report.query.raw = query;
+    return report.query.operation == Regs::ReportSemaphore::Operation::Release &&
+           report.query.short_query != 0 &&
+           report.query.report == Regs::ReportSemaphore::Report::Payload &&
+           report.query.reduction_enable == 0;
+}
+
+const u32* Maxwell3D::FrontReportData(const FrontState& fs, u32 method, u64 bytes) const {
+    // The 4-byte range FrontWriteRange gives a fence release: its words are the payload.
+    if (method != MAXWELL3D_REG_INDEX(report_semaphore.query) || bytes != sizeof(u32)) {
+        return nullptr;
+    }
+    return &fs.regs[MAXWELL3D_REG_INDEX(report_semaphore.payload)];
+}
+
+void Maxwell3D::FrontNoteReportPages(VideoCommon::GpuSplit& split, GPUVAddr begin,
+                                     GPUVAddr end) const {
+    if (!VideoCommon::GpuSplit::FrontReportReads()) {
+        return;
+    }
+    if (const auto device = memory_manager.GpuToCpuAddress(begin)) {
+        split.NoteReportPages(*device, end - begin);
+    }
 }
 
 void Maxwell3D::FrontNoteRelease(VideoCommon::GpuSplit& split, const FrontState& fs,
@@ -1319,7 +1352,11 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
     }
     // What CallMultiMethod does to the registers on the back, then one entry for all the words.
     constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
-    const auto [write_begin, write_end] = FrontWriteRange(fs, method, amount);
+    const auto [write_begin, write_end] = FrontWriteRange(
+        fs, method, amount,
+        amount == 0 ? 0U
+                    : (fs.control == Regs::ShadowRamControl::Replay ? fs.shadow[method]
+                                                                    : base_start[0]));
     const auto tracked = [&fs] {
         return fs.control == Regs::ShadowRamControl::Track ||
                fs.control == Regs::ShadowRamControl::TrackWithFilter;
@@ -1397,9 +1434,11 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
         // The uploaded words: ProcessCBMultiData writes them as sent, whatever the shadow RAM.
         const bool upload = method >= cb_data && method < cb_data + 16;
         split.RangeLastWrite(memory_manager, write_begin, write_end,
-                             upload ? base_start : nullptr);
+                             upload ? base_start
+                                    : FrontReportData(fs, method, write_end - write_begin));
         if (method == MAXWELL3D_REG_INDEX(report_semaphore.query) && amount == 1) {
             FrontNoteRelease(split, fs, base_start[0]);
+            FrontNoteReportPages(split, write_begin, write_end);
         }
     }
 }
@@ -1497,6 +1536,42 @@ bool Maxwell3D::FrontSkipsLoopWrite(FrontState& fs, u32 method, u32 value, bool 
     return method != MAXWELL3D_REG_INDEX(draw.end) || fs.instance_loop;
 }
 
+bool Maxwell3D::FrontCheckReportRead(VideoCommon::GpuSplit& split, u32 macro, GPUVAddr source,
+                                     std::vector<u32>& words) {
+    // EDEN_NX2_DMA_READ_CHECK=1 (diagnostic, from zortos PR #243): also drain, read again and log
+    // the reads that differ, then use the drained words.
+    static const bool check = std::getenv("EDEN_NX2_DMA_READ_CHECK") != nullptr;
+    if (!check) {
+        return true;
+    }
+    static u64 checks{};
+    static u64 differences{};
+    const size_t read_bytes = words.size() * sizeof(u32);
+    split.Drain(VideoCommon::DrainSite::MacroDmaCheck);
+    if (memory_manager.IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache)) {
+        split.Run(
+            [memory = &memory_manager, source, read_bytes] {
+                memory->FlushRegion(source, read_bytes, VideoCommon::CacheType::BufferCache);
+            },
+            VideoCommon::DrainSite::MacroDmaFlush);
+    }
+    std::vector<u32> exact(words.size());
+    memory_manager.ReadBlockUnsafe(source, exact.data(), read_bytes);
+    ++checks;
+    if (exact != words) {
+        if (differences++ < 16) {
+            LOG_WARNING(HW_GPU, "DMA read check: macro {:#x} read of {} words at {:#x} differs "
+                                "from the drained read",
+                        macro, words.size(), source);
+        }
+        words = std::move(exact);
+    }
+    if ((checks & 0xffff) == 1) {
+        LOG_INFO(HW_GPU, "DMA read check: {} reads, {} differed", checks, differences);
+    }
+    return true;
+}
+
 void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 macro,
                              u32 method, u32 count) {
     // The words may be written by methods still queued for the back (indirect draw arguments
@@ -1514,7 +1589,12 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
     if (fast && !Tegra::Nx2CmdPageDiag::g_enabled && !VideoCommon::QueryDma::TraceEnabled()) {
         thread_local std::vector<u32> forwarded;
         forwarded.resize(words);
-        if (split.ForwardRead(memory_manager, source, words, forwarded.data())) {
+        // EDEN_NX2_FRONT_REPORT_READS (zortos PR #243): reads of report memory take the queued
+        // words the front knows instead of waiting for them.
+        if (split.ForwardRead(memory_manager, source, words, forwarded.data()) ||
+            (VideoCommon::GpuSplit::FrontReportReads() &&
+             split.ReadReportWords(memory_manager, source, words, forwarded.data()) &&
+             FrontCheckReportRead(split, macro, source, forwarded))) {
             VideoCommon::Nx2Profile::CountDmaRead(macro);
             VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::DmaReadsForwarded, 1);
             for (u32 i = 0; i < words; ++i) {

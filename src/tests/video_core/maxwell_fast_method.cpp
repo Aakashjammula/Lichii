@@ -27,6 +27,7 @@
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2.h"
 #include "video_core/renderer_null/null_rasterizer.h"
 
 namespace VideoCommon {
@@ -952,4 +953,248 @@ TEST_CASE("Fast-drain forwarding stops at unranged writes between merged uploads
     split.RangeLastWrite(f.memory, gpu_address + 16, gpu_address + 24, first.data());
     REQUIRE_FALSE(split.ForwardRead(f.memory, gpu_address, 2, forwarded.data()));
     REQUIRE(split.HasQueuedMemoryWriters(f.memory, gpu_address, gpu_address + 8));
+}
+
+namespace {
+
+// Two pages of guest memory at GPU 0x100000 (device 0x10000), for the report-read tests.
+struct ReportMemory {
+    static constexpr VAddr cpu_address = 0x4000;
+    static constexpr DAddr device_address = 0x10000;
+    static constexpr GPUVAddr gpu_address = 0x100000;
+    Fixture& f;
+    Kernel::KProcess process;
+    Core::Asid asid{};
+    u8* backing;
+
+    explicit ReportMemory(Fixture& fixture)
+        : f{fixture}, process{fixture.system.Kernel()},
+          backing{fixture.physical.GetPointerFromRaw<u8>(0x10000)} {
+        auto& table = process.GetPageTable().GetImpl();
+        table.Resize(20, 12);
+        for (u64 page = 0; page < 2; ++page) {
+            const VAddr address = cpu_address + page * 0x1000;
+            table.entries.GetAndFault(address >> 12)
+                .Store(false, Common::PageType::Memory, 1,
+                       reinterpret_cast<uintptr_t>(backing + page * 0x1000) - address);
+        }
+        process.GetMemory().SetCurrentPageTable(process);
+        asid = f.device_memory.RegisterProcess(&process.GetMemory());
+        f.device_memory.BindInterface(&f.rasterizer);
+        f.device_memory.Map(device_address, cpu_address, 0x2000, asid);
+        f.memory.BindRasterizer(&f.rasterizer);
+        f.memory.Map(gpu_address, device_address, 0x2000, Tegra::PTEKind::PITCH, false);
+        std::memset(backing, 0, 0x2000);
+        Tegra::Nx2ClearGpuWrittenPages();
+    }
+    ~ReportMemory() {
+        Tegra::Nx2ClearGpuWrittenPages();
+        f.device_memory.Unmap(device_address, 0x2000);
+        f.device_memory.UnregisterProcess(asid);
+        f.system.Kernel().UnregisterKernelObject(&process);
+    }
+    void Store(u64 offset, u32 value) {
+        std::memcpy(backing + offset, &value, sizeof(value));
+    }
+};
+
+} // Anonymous namespace
+
+TEST_CASE("Front report reads overlay known queued words and leave unknown ones",
+          "[video_core][gpu_split_fast_drain]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    Fixture f;
+    f.system.Initialize();
+    ReportMemory m{f};
+    constexpr GPUVAddr report = ReportMemory::gpu_address;
+
+    // No back thread: everything sent stays queued, and nothing below may wait for it.
+    VideoCommon::GpuSplit split;
+    Access::Initialize(split, f.system);
+    std::array<u32, 4> out{};
+    m.Store(0, 100);
+    m.Store(4, 101);
+    m.Store(8, 102);
+    m.Store(12, 103);
+    REQUIRE_FALSE(split.ReadReportWords(f.memory, report, 4, out.data())); // Not report memory
+    split.NoteReportPages(ReportMemory::device_address, 16);
+    REQUIRE(split.ReadReportWords(f.memory, report, 4, out.data()));
+    REQUIRE(out == std::array<u32, 4>{100, 101, 102, 103});
+    REQUIRE_FALSE(split.ReadReportWords(f.memory, report + 0x1000, 1, out.data()));
+
+    // A queued fence release and constant buffer upload: their words, newest last.
+    const std::array<u32, 2> upload{7, 8};
+    split.MultiMethod(&f.fast, CbData, upload.data(), 2, 2, nullptr);
+    split.RangeLastWrite(f.memory, report + 4, report + 12, upload.data());
+    const u32 payload = 9;
+    split.Method(&f.fast, MAXWELL3D_REG_INDEX(report_semaphore.query), 0, true, nullptr);
+    split.RangeLastWrite(f.memory, report + 8, report + 12, &payload);
+    REQUIRE(split.ReadReportWords(f.memory, report, 4, out.data()));
+    REQUIRE(out == std::array<u32, 4>{100, 7, 9, 103});
+
+    // A queued counter report: its words are unknown, the caller waits for it instead.
+    split.Method(&f.fast, MAXWELL3D_REG_INDEX(report_semaphore.query), 0, true, nullptr);
+    split.RangeLastWrite(f.memory, report + 0x20, report + 0x30, nullptr);
+    REQUIRE_FALSE(split.ReadReportWords(f.memory, report + 0x24, 1, out.data()));
+    REQUIRE(split.ReadReportWords(f.memory, report, 4, out.data()));
+
+    // A page GPU shaders or copies wrote takes the waiting path.
+    Tegra::Nx2MarkGpuWritten(ReportMemory::device_address, 4);
+    REQUIRE_FALSE(split.ReadReportWords(f.memory, report, 4, out.data()));
+}
+
+TEST_CASE("Front report reads see what a draw before a wait-for-idle wrote",
+          "[video_core][gpu_split_fast_drain]") {
+    // zortos PR #243 review: a queued draw may write report memory before the back marks its
+    // pages. A guest orders a front-end read after a draw with a wait-for-idle (or a host sync),
+    // and the read waits for those, so the draw has run before the page check and the words.
+    using Access = VideoCommon::GpuSplitTestAccess;
+    Fixture f;
+    f.system.Initialize();
+    ReportMemory m{f};
+    constexpr GPUVAddr report = ReportMemory::gpu_address;
+    VideoCommon::GpuSplit split;
+    Access::Start(split, f.system);
+    SCOPE_EXIT { split.Stop(); };
+    split.NoteReportPages(ReportMemory::device_address, 16);
+    std::array<u32, 1> out{};
+    const auto draw = [&](u32 value, bool marks) {
+        // Draws do not count as memory writers: they are deferred with writes_memory = false.
+        split.Defer(
+            [&m, value, marks] {
+                std::this_thread::sleep_for(std::chrono::milliseconds{20});
+                m.Store(0, value);
+                if (marks) {
+                    Tegra::Nx2MarkGpuWritten(ReportMemory::device_address, 4);
+                }
+            },
+            false);
+        split.Method(&f.fast, MAXWELL3D_REG_INDEX(wait_for_idle), 0, true, nullptr);
+    };
+    draw(0x55, false);
+    REQUIRE(split.ReadReportWords(f.memory, report, 1, out.data()));
+    REQUIRE(out[0] == 0x55);
+    draw(0x66, true);
+    REQUIRE_FALSE(split.ReadReportWords(f.memory, report, 1, out.data()));
+    REQUIRE(f.memory.Read<u32>(report) == 0x66);
+}
+
+TEST_CASE("Split front instance-loop skips match CallMethod",
+          "[video_core][gpu_split_instance_loop]") {
+    const char* const env = std::getenv("EDEN_NX2_INSTANCE_LOOP_SKIP");
+    if (env != nullptr && (env[0] == '\0' || env[0] == '0')) {
+        SKIP("EDEN_NX2_INSTANCE_LOOP_SKIP is off in the environment");
+    }
+    setenv("EDEN_NX2_INSTANCE_LOOP_SKIP", "1", 1); // Read once, when the first front starts
+    using Access = VideoCommon::GpuSplitTestAccess;
+    constexpr u32 VertexFirst = MAXWELL3D_REG_INDEX(vertex_buffer.first);
+    constexpr u32 VertexCount = MAXWELL3D_REG_INDEX(vertex_buffer.count);
+    constexpr u32 InlineIndex = MAXWELL3D_REG_INDEX(draw_inline_index);
+    constexpr u32 BaseInstance = MAXWELL3D_REG_INDEX(global_base_instance_index);
+    constexpr u32 Subsequent = 1u << 26;
+    constexpr u32 Unchanged = 2u << 26;
+
+    // The skipped methods set no dirty flag: dropping a same-value write changes nothing else.
+    Maxwell3D::DirtyState::Tables tables{};
+    VideoCommon::Dirty::SetupDirtyFlags(tables);
+    for (const auto& table : tables) {
+        REQUIRE(table[DrawEnd] == 0);
+        REQUIRE(table[VertexFirst] == 0);
+        REQUIRE(table[VertexCount] == 0);
+    }
+
+    Fixture f;
+    f.system.Initialize();
+    for (auto* engine : {&f.slow, &f.fast}) {
+        for (const u32 method : {DrawEnd, VertexFirst, VertexCount}) {
+            engine->dirty.tables[1][method] = 0; // The fixture's own flags, not real ones
+        }
+    }
+    VideoCommon::GpuSplit split;
+    Access::Start(split, f.system);
+    SCOPE_EXIT { split.Stop(); };
+    const auto call = [&](u32 method, u32 argument) {
+        f.slow.CallMethod(f.system, method, argument, true);
+        f.fast.FrontCallMethod(f.system, split, method, argument, true);
+    };
+    const auto multi = [&](u32 method, const std::vector<u32>& words) {
+        const u32 amount = static_cast<u32>(words.size());
+        f.slow.CallMultiMethod(f.system, method, words.data(), amount, amount);
+        f.fast.FrontCallMultiMethod(f.system, split, method, words.data(), amount, amount);
+    };
+    const auto compare = [&] {
+        split.Drain(VideoCommon::DrainSite::Other);
+        f.fast.ConsumeSink(f.system); // State writes the idle back still holds
+        f.Compare();
+    };
+
+    // An instance loop, then [First, Unchanged] in one batch: the back is in General mode and
+    // the next same-value draw.end draws (zortos PR #178 review).
+    call(ShadowControl, 0);
+    call(BaseInstance, 1);
+    call(DrawBegin, 0);
+    call(DrawEnd, 0);
+    call(DrawBegin, Subsequent);
+    call(DrawEnd, 0);
+    call(DrawBegin, Subsequent);
+    call(DrawEnd, 0);
+    compare();
+    multi(DrawBegin, {0, Unchanged});
+    call(BaseInstance, 2);
+    call(DrawEnd, 0);
+    compare();
+    REQUIRE(f.fast.draw_manager.draw_state.base_instance == 2);
+
+    // Replay: the back acts on the shadow word (First), not the raw one (Subsequent).
+    call(ShadowControl, 0); // Track: the shadow draw.begin is First
+    call(DrawBegin, 0);
+    call(DrawEnd, 0);
+    call(ShadowControl, 2); // Passthrough: an instance loop, the shadow keeps First
+    call(DrawBegin, Subsequent);
+    call(DrawEnd, 0);
+    call(BaseInstance, 3);
+    call(ShadowControl, 3); // Replay
+    multi(DrawBegin, {Subsequent});
+    call(DrawEnd, 0);
+    compare();
+    REQUIRE(f.fast.draw_manager.draw_state.base_instance == 3);
+
+    // Random streams of loop methods, inline indices, state writes and shadow modes. A dropped
+    // draw shows as a stale base instance or draw state.
+    std::mt19937 rng{178};
+    for (u32 step = 0; step < 20000; ++step) {
+        CAPTURE(step);
+        const u32 kind = rng() % 100;
+        const auto small = [&] { return rng() % 3 == 0 ? rng() % 4 : 0u; };
+        if (kind < 20) {
+            const u32 id = static_cast<u32>(rng() % 3) << 26;
+            if (rng() % 4 == 0) {
+                multi(DrawBegin, {id, static_cast<u32>(rng() % 3) << 26});
+            } else {
+                call(DrawBegin, id | (rng() % 2));
+            }
+        } else if (kind < 50) {
+            call(DrawEnd, small());
+        } else if (kind < 65) {
+            call(rng() % 2 == 0 ? VertexFirst : VertexCount, small());
+        } else if (kind < 70) {
+            call(MAXWELL3D_REG_INDEX(index_buffer.count), small());
+        } else if (kind < 75) {
+            if (rng() % 2 == 0) {
+                call(InlineIndex, rng());
+            } else {
+                multi(InlineIndex, {static_cast<u32>(rng()), static_cast<u32>(rng())});
+            }
+        } else if (kind < 90) {
+            call(BaseInstance, rng() % 8);
+        } else if (kind < 95) {
+            call(ShadowControl, rng() % 4);
+        } else {
+            call(MAXWELL3D_REG_INDEX(vertex_array_instance_first), rng() % 64);
+        }
+        if (step % 16 == 15) {
+            compare();
+        }
+    }
+    compare();
 }

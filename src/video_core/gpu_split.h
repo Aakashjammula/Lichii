@@ -12,6 +12,7 @@
 #include <optional>
 #include <thread>
 #include <type_traits>
+#include <unordered_set>
 #include <vector>
 
 #include "common/common_types.h"
@@ -244,6 +245,21 @@ public:
     std::optional<u32> QueuedReleasePayload(const Tegra::MemoryManager& memory, GPUVAddr address,
                                             u32* miss = nullptr);
 
+    /// EDEN_NX2_FRONT_REPORT_READS=1 (default off, needs EDEN_NX2_FAST_DRAIN): macro memory reads
+    /// of report memory are answered on the front (ReadReportWords) when the words can be known.
+    [[nodiscard]] static bool FrontReportReads();
+    /// A 3D report was just sent to device range [begin, begin + size): its 4 KiB pages are
+    /// report memory (query and semaphore pools).
+    void NoteReportPages(DAddr begin, u64 size);
+    /// For a macro memory read of `words` words at `begin` on report memory that no GPU shader or
+    /// copy wrote: waits for the queued unranged writers (compute, copies, wait-for-idle, host
+    /// syncs, deferred work), then copies the words in guest memory to `out` with the overlapping
+    /// queued ranged writes whose words are known (constant buffer uploads, payload releases)
+    /// applied on top. False, with nothing waited for past the unranged writers, when the read is
+    /// not on report memory, its pages were GPU-written or are not contiguous, a queued function
+    /// may remap them, or an overlapping queued write's words are unknown (a counter report).
+    bool ReadReportWords(const Tegra::MemoryManager& memory, GPUVAddr begin, u32 words, u32* out);
+
 private:
     friend struct GpuSplitTestAccess;
 
@@ -350,6 +366,7 @@ private:
         u32 payload;
     };
     std::array<QueuedRelease, 64> queued_releases{};
+    std::unordered_set<u64> report_pages; ///< EDEN_NX2_FRONT_REPORT_READS: 4 KiB device pages
     /// Drops consumed ranged writes; returns the position a memory read of `range` waits for and
     /// the method behind it.
     u64 MemoryWriterTarget(u64 done, const MemoryRange& range, u32& target_method);

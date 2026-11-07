@@ -149,6 +149,7 @@ void GpuSplit::Stop() {
     previous_memory_write_method = DeferredWrite;
     ranged_writes.clear();
     queued_releases = {};
+    report_pages.clear();
     published_local = 0;
     consumed_cache = 0;
     publish_every = PublishEvery;
@@ -465,6 +466,95 @@ std::optional<u32> GpuSplit::QueuedReleasePayload(const Tegra::MemoryManager& me
         return std::nullopt;
     }
     return release.payload;
+}
+
+bool GpuSplit::FrontReportReads() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_FRONT_REPORT_READS");
+        const bool on = value != nullptr && value[0] != '\0' && value[0] != '0';
+        if (on && !FastDrain()) {
+            LOG_WARNING(HW_GPU, "EDEN_NX2_FRONT_REPORT_READS needs EDEN_NX2_FAST_DRAIN=1; ignored");
+            return false;
+        }
+        if (on) {
+            LOG_INFO(HW_GPU, "EDEN_NX2_FRONT_REPORT_READS: macro reads of report memory take "
+                             "queued known words instead of waiting for them");
+        }
+        return on;
+    }();
+    return enabled;
+}
+
+void GpuSplit::NoteReportPages(DAddr begin, u64 size) {
+    for (u64 page = begin >> 12; page <= (begin + size - 1) >> 12; ++page) {
+        report_pages.insert(page);
+    }
+}
+
+bool GpuSplit::ReadReportWords(const Tegra::MemoryManager& memory, GPUVAddr begin, u32 words,
+                               u32* out) {
+    const u64 bytes = u64{words} * sizeof(u32);
+    if (words == 0 || report_pages.empty()) {
+        return false;
+    }
+    const MemoryRange range = Translate(memory, begin, begin + bytes);
+    if (!range.device) {
+        return false; // Unmapped, sparse or not contiguous on the device
+    }
+    const DAddr device = *range.device;
+    const auto clean = [&] {
+        for (u64 page = device >> 12; page <= (device + bytes - 1) >> 12; ++page) {
+            // Draws and dispatches don't write report memory; a page GPU shaders or copies wrote
+            // takes the waiting path, which also flushes the buffer cache.
+            if (!report_pages.contains(page) || Tegra::Nx2IsGpuWritten(page << 12)) {
+                return false;
+            }
+        }
+        return last_function_position <= consumed.load(std::memory_order_acquire);
+    };
+    if (!clean()) {
+        return false;
+    }
+    // Writers the front knows no range of. A wait-for-idle or host sync orders the draws before
+    // it: once the back ran them, their buffer writes marked the pages they wrote (checked again
+    // below). The front end's reads are not ordered after a draw without one on hardware either.
+    const u64 unranged = std::min(
+        std::max({last_writer_position, last_sync_position, last_memory_write_position}),
+        write_position);
+    WaitFor(unranged, DrainSite::MacroDmaRead);
+    if (!clean()) {
+        return false;
+    }
+    const u64 since = consumed.load(std::memory_order_acquire);
+    while (!ranged_writes.empty() && ranged_writes.front().position <= since) {
+        ranged_writes.pop_front();
+    }
+    std::array<const RangedWrite*, 64> overlapping;
+    size_t found = 0;
+    for (const RangedWrite& write : ranged_writes) {
+        if (!Overlaps(write, range)) {
+            continue;
+        }
+        const u64 size = write.range.end - write.range.begin;
+        if (found == overlapping.size() || write.data.size() * sizeof(u32) != size ||
+            (*write.range.device & 3) != (device & 3)) {
+            return false; // Words unknown: the caller waits for the write
+        }
+        overlapping[found++] = &write;
+    }
+    // Writes the back runs from here on either land before the read below or are applied again
+    // on top of it, oldest first, with the same words.
+    memory.ReadBlockUnsafe(begin, out, bytes);
+    for (size_t i = 0; i < found; ++i) {
+        const RangedWrite& write = *overlapping[i];
+        const DAddr write_begin = *write.range.device;
+        const DAddr first = std::max(write_begin, device);
+        const DAddr last = std::min(write_begin + write.data.size() * sizeof(u32), device + bytes);
+        for (DAddr address = first; address < last; address += sizeof(u32)) {
+            out[(address - device) / sizeof(u32)] = write.data[(address - write_begin) / sizeof(u32)];
+        }
+    }
+    return true;
 }
 
 bool GpuSplit::WaitFor(u64 target, DrainSite site) {

@@ -3408,7 +3408,16 @@ private:
     /// EDEN_NX2_FAST_DRAIN: the memory `amount` words of `method` write, if known (constant
     /// buffer uploads, reports); {0, 0} otherwise.
     std::pair<GPUVAddr, GPUVAddr> FrontWriteRange(const FrontState& state, u32 method,
-                                                  u32 amount) const;
+                                                  u32 amount, u32 first_word) const;
+    /// A report query word that releases its payload as a fence (short, no reduction).
+    static bool FrontIsFenceRelease(u32 query);
+    /// EDEN_NX2_FRONT_REPORT_READS: the words a report range from FrontWriteRange writes, when
+    /// known (a fence release's payload); nullptr otherwise.
+    const u32* FrontReportData(const FrontState& state, u32 method, u64 bytes) const;
+    void FrontNoteReportPages(VideoCommon::GpuSplit& split, GPUVAddr begin, GPUVAddr end) const;
+    /// EDEN_NX2_DMA_READ_CHECK: compares a front report read with a drained one (keeps the latter).
+    bool FrontCheckReportRead(VideoCommon::GpuSplit& split, u32 macro, GPUVAddr source,
+                              std::vector<u32>& words);
     /// Tells the split a report just sent releases a known payload (GpuSplit::NoteRelease).
     void FrontNoteRelease(VideoCommon::GpuSplit& split, const FrontState& state, u32 query) const;
     void FrontVerify(VideoCommon::GpuSplit& split, FrontState& state);
