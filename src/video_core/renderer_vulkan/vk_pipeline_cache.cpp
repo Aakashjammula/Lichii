@@ -1368,8 +1368,6 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     std::array<std::optional<Shader::RuntimeInfo>, Maxwell::MaxShaderStage> deferred_runtime_infos;
     std::array<std::vector<u32>, Maxwell::MaxShaderStage> reference_spirv;
 
-    const Shader::IR::Program* previous_stage{};
-    Shader::Backend::Bindings binding;
     for (size_t index = uses_vertex_a && uses_vertex_b ? 1 : 0; index < Maxwell::MaxShaderProgram;
          ++index) {
         const bool is_emulated_stage = layer_source_program != nullptr &&
@@ -1378,10 +1376,28 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             continue;
         }
         UNIMPLEMENTED_IF(index == 0);
+        infos[index - 1] = &programs[index].info;
+    }
+    // GraphicsPipeline makes the same decision from the same infos for the descriptor layout.
+    const bool stage_bindings = GraphicsStageBindingsRequested() && GraphicsStageBindingsFit(infos);
+    if (GraphicsStageBindingsRequested() && !stage_bindings) {
+        LOG_WARNING(Render_Vulkan,
+                    "Pipeline {:016x} has a stage with more than {} bindings; it keeps the "
+                    "carried-over binding numbers",
+                    key.Hash(), GRAPHICS_STAGE_BINDING_STRIDE);
+    }
 
+    const Shader::IR::Program* previous_stage{};
+    Shader::Backend::Bindings binding;
+    for (size_t stage_index = 0; stage_index < infos.size(); ++stage_index) {
+        if (infos[stage_index] == nullptr) {
+            continue;
+        }
+        const size_t index{stage_index + 1};
         Shader::IR::Program& program{programs[index]};
-        const size_t stage_index{index - 1};
-        infos[stage_index] = &program.info;
+        if (stage_bindings) {
+            BeginGraphicsStageBindings(binding, stage_index);
+        }
 
         const auto runtime_info{MakeRuntimeInfo(programs, key, program, previous_stage, device)};
         ConvertLegacyToGeneric(program, runtime_info);
@@ -1413,12 +1429,16 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                 infos[stage] = &job->programs[stage + 1].info;
             }
         }
-        emit_stages = [this, job = std::move(job), hashes = key.unique_hashes]() mutable {
+        emit_stages = [this, job = std::move(job), hashes = key.unique_hashes,
+                       stage_bindings]() mutable {
             const auto begin = std::chrono::steady_clock::now();
             std::array<vk::ShaderModule, Maxwell::MaxShaderStage> stage_modules;
             Shader::Backend::Bindings stage_binding;
             for (size_t stage = 0; stage < stage_modules.size(); ++stage) {
                 if (job->runtime_infos[stage]) {
+                    if (stage_bindings) {
+                        BeginGraphicsStageBindings(stage_binding, stage);
+                    }
                     stage_modules[stage] =
                         EmitShaderModule(device, profile, *job->runtime_infos[stage],
                                          job->programs[stage + 1], stage_binding,

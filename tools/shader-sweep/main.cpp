@@ -540,6 +540,7 @@ int main(int argc, char** argv) {
         bool lower_only{};
         bool packed_code{};
         bool capture_extent{};
+        u32 binding_base{};
         for (int i = 1; i < argc; ++i) {
             const std::string arg{argv[i]};
             if (arg == "--help") {
@@ -547,7 +548,7 @@ int main(int argc, char** argv) {
                              "vertex|tess-control|tess-eval|geometry|fragment|compute|task|mesh]\n"
                              "  [--format instructions|native-header] [--environment FILE "
                              "--cache-version 46|47|48|49|50|51|52|53]\n"
-                             "  [--pipeline-key FILE] [--capture-extent] "
+                             "  [--pipeline-key FILE] [--capture-extent] [--binding-base N] "
                              "(--output SPV | --lower-only WORDS | --packed-code WORDS)\n";
                 return 0;
             }
@@ -572,6 +573,8 @@ int main(int argc, char** argv) {
                 environment = value;
             else if (arg == "--pipeline-key")
                 pipeline_key = value;
+            else if (arg == "--binding-base")
+                binding_base = static_cast<u32>(std::stoul(value));
             else if (arg == "--cache-version") {
                 if (value != "46" && value != "47" && value != "48" && value != "49" && value != "50" &&
                     value != "51" && value != "52" && value != "53")
@@ -768,7 +771,9 @@ int main(int argc, char** argv) {
         profile.max_user_clip_distances = 8;
         profile.max_subgroup_size = 32;
         profile.support_typeless_image_loads = true;
+        // --binding-base: the first descriptor binding, as a stage later in a pipeline gets.
         Shader::Backend::Bindings bindings{};
+        bindings.unified = binding_base;
         const auto spirv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime, program, bindings);
         diagnostic["spirv_words"] = spirv.size();
         diagnostic["phase"] = "output";

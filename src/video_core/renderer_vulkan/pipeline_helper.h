@@ -8,12 +8,15 @@
 
 #include <cstddef>
 #include <optional>
+#include <span>
 
 #include <boost/container/small_vector.hpp>
 
+#include "common/assert.h"
 #include "common/common_types.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/shader_info.h"
+#include "video_core/renderer_vulkan/pipeline_shader_emission.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
 #include "video_core/surface.h"
@@ -146,6 +149,8 @@ inline void WriteDescriptorBuffer(const Device& device, const DescriptorBufferLa
 class DescriptorLayoutBuilder {
 public:
     DescriptorLayoutBuilder(const Device& device_) : device{&device_} {}
+    /// Binding bookkeeping only; the methods that create Vulkan objects need a device.
+    DescriptorLayoutBuilder() = default;
 
     bool CanUsePushDescriptor() const noexcept {
         if (!device->IsKhrPushDescriptorSupported() ||
@@ -278,6 +283,22 @@ public:
         Add(VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, stage, info.image_buffer_descriptors);
         Add(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, stage, info.texture_descriptors);
         Add(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, stage, info.image_descriptors);
+    }
+
+    /// The next stage's bindings start at its fixed base (EDEN_NX2_GPL_STAGE_BINDINGS).
+    void StartGraphicsStage(size_t stage_index) {
+        const u32 base = GraphicsStageFirstBinding(stage_index);
+        ASSERT(binding <= base);
+        binding = base;
+    }
+
+    [[nodiscard]] std::span<const VkDescriptorSetLayoutBinding> LayoutBindings() const noexcept {
+        return bindings;
+    }
+
+    [[nodiscard]] std::span<const VkDescriptorUpdateTemplateEntry> TemplateEntries()
+        const noexcept {
+        return entries;
     }
 
 private:

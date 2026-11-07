@@ -81,9 +81,13 @@ VkShaderStageFlagBits StageFlag(const Shader::Info& info, VkShaderStageFlagBits 
     return slot_stage;
 }
 
-DescriptorLayoutBuilder MakeBuilder(const Device& device, std::span<const Shader::Info> infos) {
+DescriptorLayoutBuilder MakeBuilder(const Device& device, std::span<const Shader::Info> infos,
+                                    bool stage_bindings) {
     DescriptorLayoutBuilder builder{device};
     for (size_t index = 0; index < infos.size(); ++index) {
+        if (stage_bindings) {
+            builder.StartGraphicsStage(index);
+        }
         static constexpr std::array stages{
             VK_SHADER_STAGE_VERTEX_BIT,
             VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT,
@@ -331,7 +335,10 @@ GraphicsPipeline::GraphicsPipeline(
                any_written(info.image_descriptors) || any_written(info.image_buffer_descriptors);
     });
 
-    DescriptorLayoutBuilder builder{MakeBuilder(device, stage_infos)};
+    // Matches the numbering PipelineCache::CreateGraphicsPipeline emitted the stages with.
+    const bool stage_bindings =
+        GraphicsStageBindingsRequested() && GraphicsStageBindingsFit(infos);
+    DescriptorLayoutBuilder builder{MakeBuilder(device, stage_infos, stage_bindings)};
     uses_push_descriptor = builder.CanUsePushDescriptor();
     uses_descriptor_buffer = builder.CanUseDescriptorBuffer() && descriptor_buffer_ring.IsValid();
     descriptor_set_layout =
