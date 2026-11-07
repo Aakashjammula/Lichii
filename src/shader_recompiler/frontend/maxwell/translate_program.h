@@ -28,7 +28,9 @@ void ConvertLegacyToGeneric(IR::Program& program, const RuntimeInfo& runtime_inf
 // Makes a vertex or fragment stage's varying interface independent of the other stage
 // (EDEN_NX2_GPL_FIXED_INTERFACES): the vertex stage declares all 32 generic outputs, unwritten
 // ones holding the default it already writes, and the fragment stage declares every generic it
-// loads. A fragment stage that loads legacy varyings or indexes its inputs keeps the interface
+// loads that the vertex stage writes (unwritten ones stay constants, as when linked; pass the
+// vertex stage's stores in previous_stage_stores). A fragment stage that loads legacy varyings
+// or indexes its inputs keeps the interface
 // derived from the previous stage, since only that preserves which generic a legacy varying
 // lives in and the values of unwritten inputs. Call before ConvertLegacyToGeneric.
 // Returns whether the stage's interface is now fixed.

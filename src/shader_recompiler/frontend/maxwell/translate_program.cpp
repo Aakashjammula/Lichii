@@ -577,17 +577,30 @@ bool UseFixedStageInterface(const IR::Program& program, RuntimeInfo& runtime_inf
     case Stage::VertexB:
         runtime_info.declare_all_generic_outputs = true;
         return true;
-    case Stage::Fragment:
+    case Stage::Fragment: {
         if (program.info.loads.Legacy() || program.info.loads_indexed_attributes) {
             return false;
         }
-        // An undeclared input reads (0, 0, 0, 1); the vertex stage now writes that default to
-        // every generic it does not store, so declaring them all reads the same values.
-        runtime_info.previous_stage_stores = {};
-        runtime_info.previous_stage_stores.mask.set();
+        // Every generic is declared except the ones this stage loads and the vertex stage does
+        // not write: those stay undeclared and read the constant (0, 0, 0, 1), as when linked.
+        // The vertex stage's default write would arrive interpolated, and a perspective-correct
+        // 1.0 is not exact (one ulp off in about half the fragments on NVIDIA). So the module
+        // depends on the vertex stage only through generics it reads without their being written.
+        VaryingState stores{};
+        stores.mask.set();
+        for (size_t index = 0; index < IR::NUM_GENERICS; ++index) {
+            if (program.info.loads.Generic(index) &&
+                !runtime_info.previous_stage_stores.Generic(index)) {
+                for (size_t element = 0; element < 4; ++element) {
+                    stores.Set(IR::Attribute::Generic0X + index * 4 + element, false);
+                }
+            }
+        }
+        runtime_info.previous_stage_stores = stores;
         runtime_info.previous_stage_legacy_stores_mapping.clear();
         runtime_info.per_primitive_generics.reset();
         return true;
+    }
     default:
         return false;
     }

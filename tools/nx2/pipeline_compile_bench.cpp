@@ -15,6 +15,12 @@
 //   __GL_SHADER_DISK_CACHE=0 ./pipeline_compile_bench <dir> [--order opt-first|fast-first]
 //       [--only opt|fast] [--salt N]
 //
+//   __GL_SHADER_DISK_CACHE=0 ./pipeline_compile_bench <dir> --gpl fast|lto [--order lib-first]
+//
+// --gpl times a monolithic pipeline against the four graphics pipeline libraries and their fast
+// link, and the first submit with each; "lto" also retains link-time optimization info and times
+// an optimized link. Its "gpl" lines (stage hashes, layout hash, times) feed reuse analyses.
+//
 // Each build salts the SPIR-V header so no driver cache can serve it; --salt N fixes the salts
 // (opt and fast then share one) to test whether the driver's disk cache keys on the flag.
 
@@ -210,7 +216,10 @@ struct Context {
     VkInstance instance{};
     VkPhysicalDevice physical{};
     VkDevice device{};
+    VkQueue queue{};
+    VkCommandPool pool{};
     bool stats{};
+    bool gpl{};
 };
 
 bool print_stats = false;
@@ -248,6 +257,7 @@ Context CreateContext() {
         "VK_EXT_transform_feedback",          "VK_KHR_fragment_shader_barycentric",
         "VK_EXT_fragment_shader_interlock",   "VK_EXT_shader_atomic_float",
         "VK_EXT_robustness2",                 "VK_KHR_pipeline_executable_properties",
+        "VK_KHR_pipeline_library",            "VK_EXT_graphics_pipeline_library",
     };
     std::vector<const char*> enabled;
     for (const char* name : wanted) {
@@ -257,8 +267,11 @@ Context CreateContext() {
             }
         }
     }
+    VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT gpl_features{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT};
     VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR executable_props{
-        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR};
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR,
+        &gpl_features};
     VkPhysicalDeviceRobustness2FeaturesEXT robustness2{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT, &executable_props};
     VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
@@ -290,6 +303,14 @@ Context CreateContext() {
                                  nullptr};
     CHECK(vkCreateDevice(ctx.physical, &dci, nullptr, &ctx.device));
     ctx.stats = executable_props.pipelineExecutableInfo == VK_TRUE;
+    ctx.gpl = gpl_features.graphicsPipelineLibrary == VK_TRUE &&
+              std::find_if(enabled.begin(), enabled.end(), [](const char* n) {
+                  return std::strcmp(n, "VK_EXT_graphics_pipeline_library") == 0;
+              }) != enabled.end();
+    vkGetDeviceQueue(ctx.device, 0, 0, &ctx.queue);
+    const VkCommandPoolCreateInfo pool_ci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, nullptr,
+                                          VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, 0};
+    CHECK(vkCreateCommandPool(ctx.device, &pool_ci, nullptr, &ctx.pool));
     return ctx;
 }
 
@@ -298,6 +319,52 @@ struct Pipeline {
     std::vector<uint32_t> vs, fs;
     Reflection vr, fr;
 };
+
+/// Records, submits and waits for an empty draw with the pipeline bound, so a driver that defers
+/// compilation to first use shows it here. Colour and depth views are null (writes discarded).
+double FirstUse(const Context& ctx, VkPipeline pipeline, uint32_t num_colors) {
+    VkCommandBuffer cmd;
+    const VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, nullptr,
+                                         ctx.pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1};
+    CHECK(vkAllocateCommandBuffers(ctx.device, &ai, &cmd));
+    VkFence fence;
+    const VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    CHECK(vkCreateFence(ctx.device, &fci, nullptr, &fence));
+    const auto begin = std::chrono::steady_clock::now();
+    const VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, nullptr,
+                                      VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, nullptr};
+    CHECK(vkBeginCommandBuffer(cmd, &bi));
+    std::vector<VkRenderingAttachmentInfo> colors(num_colors,
+                                                  {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO});
+    VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
+    ri.renderArea = {{0, 0}, {64, 64}};
+    ri.layerCount = 1;
+    ri.colorAttachmentCount = num_colors;
+    ri.pColorAttachments = colors.data();
+    vkCmdBeginRendering(cmd, &ri);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+    const VkViewport viewport{0, 0, 64, 64, 0, 1};
+    const VkRect2D scissor{{0, 0}, {64, 64}};
+    vkCmdSetViewport(cmd, 0, 1, &viewport);
+    vkCmdSetScissor(cmd, 0, 1, &scissor);
+    vkCmdDraw(cmd, 0, 1, 0, 0);
+    vkCmdEndRendering(cmd);
+    CHECK(vkEndCommandBuffer(cmd));
+    const VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr, 0, nullptr, nullptr, 1, &cmd};
+    CHECK(vkQueueSubmit(ctx.queue, 1, &si, fence));
+    CHECK(vkWaitForFences(ctx.device, 1, &fence, VK_TRUE, UINT64_MAX));
+    const double ms = std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - begin)
+                          .count();
+    vkDestroyFence(ctx.device, fence, nullptr);
+    vkFreeCommandBuffers(ctx.device, ctx.pool, 1, &cmd);
+    return ms;
+}
+
+/// Set by --gpl: Build times the first use of the monolithic pipeline into it.
+double* first_use_out = nullptr;
+/// --order lib-first with --gpl: build the libraries before the monolithic pipeline.
+bool libraries_first = false;
 
 /// Builds one pipeline from salted copies of the modules (a distinct word in the SPIR-V
 /// header's generator field), so no in-process or on-disk driver cache can serve it.
@@ -459,6 +526,9 @@ double Build(const Context& ctx, const Pipeline& p, VkPipelineCreateFlags flags,
             std::printf("\n");
         }
     }
+    if (pipeline && first_use_out) {
+        *first_use_out = FirstUse(ctx, pipeline, num_colors);
+    }
     if (pipeline) {
         vkDestroyPipeline(dev, pipeline, nullptr);
     }
@@ -469,6 +539,242 @@ double Build(const Context& ctx, const Pipeline& p, VkPipelineCreateFlags flags,
         vkDestroyDescriptorSetLayout(dev, l, nullptr);
     }
     return ms_taken;
+}
+
+struct GplTimes {
+    double full{-1}, vi{-1}, pre{-1}, frag{-1}, out{-1}, link{-1}, lto{-1};
+    double full_use{-1}, link_use{-1}; ///< first submit with the pipeline bound
+    uint64_t layout_hash{};            ///< descriptor layout shared by the libraries
+    bool ok{};
+};
+
+double Ms(std::chrono::steady_clock::time_point begin) {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin)
+        .count();
+}
+
+/// --gpl: one monolithic pipeline, then the four graphics pipeline libraries (salted apart from
+/// the monolithic build), a fast link (no LINK_TIME_OPTIMIZATION) and optionally an optimized
+/// link. All libraries share one pipeline layout (set 0 holds both stages' bindings).
+GplTimes BuildGpl(const Context& ctx, const Pipeline& p, uint32_t salt, bool retain) {
+    GplTimes t;
+    bool ok = true;
+    if (!libraries_first) {
+        first_use_out = &t.full_use;
+        t.full = Build(ctx, p, 0, salt, &ok);
+        first_use_out = nullptr;
+        if (!ok) {
+            return t;
+        }
+    }
+    VkDevice dev = ctx.device;
+    std::map<uint32_t, std::map<uint32_t, VkDescriptorSetLayoutBinding>> sets;
+    const auto add = [&](const Reflection& r, VkShaderStageFlags stage) {
+        for (const auto& b : r.bindings) {
+            auto [it, inserted] = sets[b.set].try_emplace(
+                b.binding, VkDescriptorSetLayoutBinding{b.binding, b.type, b.count, stage, nullptr});
+            if (!inserted) {
+                it->second.stageFlags |= stage;
+            }
+        }
+    };
+    add(p.vr, VK_SHADER_STAGE_VERTEX_BIT);
+    add(p.fr, VK_SHADER_STAGE_FRAGMENT_BIT);
+    const uint32_t num_sets = sets.empty() ? 0 : sets.rbegin()->first + 1;
+    std::vector<VkDescriptorSetLayout> layouts(num_sets);
+    t.layout_hash = 1469598103934665603ull;
+    for (uint32_t s = 0; s < num_sets; ++s) {
+        std::vector<VkDescriptorSetLayoutBinding> list;
+        for (auto& [_, b] : sets[s]) {
+            list.push_back(b);
+            for (uint64_t v : {uint64_t{s}, uint64_t{b.binding}, uint64_t{b.descriptorType},
+                               uint64_t{b.descriptorCount}, uint64_t{b.stageFlags}}) {
+                t.layout_hash = (t.layout_hash ^ v) * 1099511628211ull;
+            }
+        }
+        const VkDescriptorSetLayoutCreateInfo ci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+                                                 nullptr, 0, static_cast<uint32_t>(list.size()),
+                                                 list.data()};
+        CHECK(vkCreateDescriptorSetLayout(dev, &ci, nullptr, &layouts[s]));
+    }
+    const VkPushConstantRange push{VK_SHADER_STAGE_ALL_GRAPHICS, 0, 128};
+    const VkPipelineLayoutCreateInfo lci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, nullptr, 0,
+                                         num_sets, layouts.data(), 1, &push};
+    VkPipelineLayout layout;
+    CHECK(vkCreatePipelineLayout(dev, &lci, nullptr, &layout));
+
+    std::vector<uint32_t> vs = p.vs, fs = p.fs;
+    vs[2] = fs[2] = 0x7ffe0000u ^ salt;
+    VkShaderModule modules[2];
+    const VkShaderModuleCreateInfo vci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, nullptr, 0,
+                                       vs.size() * 4, vs.data()};
+    const VkShaderModuleCreateInfo fci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, nullptr, 0,
+                                       fs.size() * 4, fs.data()};
+    CHECK(vkCreateShaderModule(dev, &vci, nullptr, &modules[0]));
+    CHECK(vkCreateShaderModule(dev, &fci, nullptr, &modules[1]));
+    const VkPipelineShaderStageCreateInfo vs_stage{
+        VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT,
+        modules[0], "main", nullptr};
+    const VkPipelineShaderStageCreateInfo fs_stage{
+        VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
+        VK_SHADER_STAGE_FRAGMENT_BIT, modules[1], "main", nullptr};
+    std::vector<VkVertexInputBindingDescription> vbind;
+    std::vector<VkVertexInputAttributeDescription> vattr;
+    for (const auto& [loc, base] : p.vr.inputs) {
+        const uint32_t index = static_cast<uint32_t>(vbind.size());
+        vbind.push_back({index, 16, VK_VERTEX_INPUT_RATE_VERTEX});
+        vattr.push_back({loc, index, AttributeFormat(base), 0});
+    }
+    const VkPipelineVertexInputStateCreateInfo vertex{
+        VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+        nullptr,
+        0,
+        static_cast<uint32_t>(vbind.size()),
+        vbind.data(),
+        static_cast<uint32_t>(vattr.size()),
+        vattr.data()};
+    const VkPipelineInputAssemblyStateCreateInfo ia{
+        VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, nullptr, 0,
+        VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, VK_FALSE};
+    const VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+                                               nullptr, 0, 1, nullptr, 1, nullptr};
+    VkPipelineRasterizationStateCreateInfo rs{
+        VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    rs.polygonMode = VK_POLYGON_MODE_FILL;
+    rs.lineWidth = 1.0f;
+    VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    VkPipelineDepthStencilStateCreateInfo ds{
+        VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    ds.depthTestEnable = VK_TRUE;
+    ds.depthWriteEnable = VK_TRUE;
+    ds.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+    const uint32_t num_colors = p.fr.outputs.empty() ? 0 : p.fr.outputs.rbegin()->first + 1;
+    std::vector<VkFormat> formats(num_colors, VK_FORMAT_UNDEFINED);
+    for (const auto& [loc, base] : p.fr.outputs) {
+        formats[loc] = ColorFormat(base);
+    }
+    std::vector<VkPipelineColorBlendAttachmentState> blend(num_colors);
+    for (auto& b : blend) {
+        b.colorWriteMask = 0xf;
+    }
+    const VkPipelineColorBlendStateCreateInfo cb{
+        VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, nullptr, 0, VK_FALSE,
+        VK_LOGIC_OP_COPY, num_colors, blend.data(), {}};
+    const VkDynamicState dyn_states[]{VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    const VkPipelineDynamicStateCreateInfo dyn{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+                                               nullptr, 0, 2, dyn_states};
+    const VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
+                                                  nullptr,
+                                                  0,
+                                                  num_colors,
+                                                  formats.data(),
+                                                  VK_FORMAT_D32_SFLOAT,
+                                                  VK_FORMAT_UNDEFINED};
+    const VkPipelineCreateFlags lib_flags =
+        VK_PIPELINE_CREATE_LIBRARY_BIT_KHR |
+        (retain ? VK_PIPELINE_CREATE_RETAIN_LINK_TIME_OPTIMIZATION_INFO_BIT_EXT : 0);
+    const auto make_lib = [&](VkGraphicsPipelineLibraryFlagsEXT part, double* out_ms) {
+        VkGraphicsPipelineLibraryCreateInfoEXT lib_info{
+            VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT,
+            const_cast<VkPipelineRenderingCreateInfo*>(&rendering), part};
+        VkGraphicsPipelineCreateInfo gci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+        gci.pNext = &lib_info;
+        gci.flags = lib_flags;
+        gci.layout = layout;
+        switch (part) {
+        case VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT:
+            gci.pVertexInputState = &vertex;
+            gci.pInputAssemblyState = &ia;
+            gci.layout = VK_NULL_HANDLE;
+            break;
+        case VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT:
+            gci.stageCount = 1;
+            gci.pStages = &vs_stage;
+            gci.pViewportState = &vp;
+            gci.pRasterizationState = &rs;
+            gci.pDynamicState = &dyn;
+            break;
+        case VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT:
+            gci.stageCount = 1;
+            gci.pStages = &fs_stage;
+            gci.pMultisampleState = &ms;
+            gci.pDepthStencilState = &ds;
+            break;
+        default:
+            gci.pMultisampleState = &ms;
+            gci.pColorBlendState = &cb;
+            gci.layout = VK_NULL_HANDLE;
+            break;
+        }
+        VkPipeline lib{};
+        const auto begin = std::chrono::steady_clock::now();
+        const VkResult r = vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gci, nullptr, &lib);
+        *out_ms = Ms(begin);
+        return r == VK_SUCCESS ? lib : VK_NULL_HANDLE;
+    };
+    VkPipeline libs[4]{
+        make_lib(VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT, &t.vi),
+        make_lib(VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT, &t.pre),
+        make_lib(VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT, &t.frag),
+        make_lib(VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT, &t.out),
+    };
+    t.ok = libs[0] && libs[1] && libs[2] && libs[3];
+    if (t.ok) {
+        const auto link = [&](VkPipelineCreateFlags flags, double* out_ms) {
+            const VkPipelineLibraryCreateInfoKHR lib_info{
+                VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR, nullptr, 4, libs};
+            VkGraphicsPipelineCreateInfo gci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+            gci.pNext = &lib_info;
+            gci.flags = flags;
+            gci.layout = layout;
+            VkPipeline pipeline{};
+            const auto begin = std::chrono::steady_clock::now();
+            const VkResult r =
+                vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gci, nullptr, &pipeline);
+            *out_ms = Ms(begin);
+            if (pipeline && flags == 0) {
+                t.link_use = FirstUse(ctx, pipeline, num_colors);
+            }
+            if (pipeline) {
+                vkDestroyPipeline(dev, pipeline, nullptr);
+            }
+            return r == VK_SUCCESS;
+        };
+        t.ok = link(0, &t.link);
+        if (t.ok && retain) {
+            t.ok = link(VK_PIPELINE_CREATE_LINK_TIME_OPTIMIZATION_BIT_EXT, &t.lto);
+        }
+    }
+    for (VkPipeline lib : libs) {
+        if (lib) {
+            vkDestroyPipeline(dev, lib, nullptr);
+        }
+    }
+    vkDestroyShaderModule(dev, modules[0], nullptr);
+    vkDestroyShaderModule(dev, modules[1], nullptr);
+    vkDestroyPipelineLayout(dev, layout, nullptr);
+    for (VkDescriptorSetLayout l : layouts) {
+        vkDestroyDescriptorSetLayout(dev, l, nullptr);
+    }
+    if (libraries_first) {
+        first_use_out = &t.full_use;
+        t.full = Build(ctx, p, 0, salt, &ok);
+        first_use_out = nullptr;
+        t.ok = t.ok && ok;
+    }
+    return t;
+}
+
+/// SPIR-V identity for the reuse analysis, ignoring the generator word that carries the salt.
+uint64_t HashWords(const std::vector<uint32_t>& words) {
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < words.size(); ++i) {
+        if (i != 2) {
+            h = (h ^ words[i]) * 1099511628211ull;
+        }
+    }
+    return h;
 }
 
 void Summary(const char* label, std::vector<double> times) {
@@ -498,11 +804,18 @@ int main(int argc, char** argv) {
     uint32_t salt_base = static_cast<uint32_t>(
         std::chrono::steady_clock::now().time_since_epoch().count());
     bool fixed_salt = false;
+    bool gpl_mode = false;
+    bool gpl_retain = false;
     for (int i = 2; i + 1 < argc; i += 2) {
         const std::string arg = argv[i];
         if (arg == "--order") fast_first = std::string(argv[i + 1]) == "fast-first";
+        if (arg == "--order") libraries_first = std::string(argv[i + 1]) == "lib-first";
         if (arg == "--only") only = argv[i + 1];
         if (arg == "--stats") print_stats = std::string(argv[i + 1]) == "1";
+        if (arg == "--gpl") {
+            gpl_mode = true;
+            gpl_retain = std::string(argv[i + 1]) == "lto";
+        }
         if (arg == "--salt") {
             salt_base = static_cast<uint32_t>(std::stoul(argv[i + 1]));
             fixed_salt = true;
@@ -527,6 +840,56 @@ int main(int argc, char** argv) {
         pipelines.push_back(std::move(p));
     }
     const Context ctx = CreateContext();
+    if (gpl_mode) {
+        if (!ctx.gpl) {
+            std::fprintf(stderr, "VK_EXT_graphics_pipeline_library unavailable\n");
+            return 1;
+        }
+        std::vector<double> full, vi, pre, frag, out, link, lto, full_use, link_use;
+        size_t failed = 0;
+        for (size_t i = 0; i < pipelines.size(); ++i) {
+            const GplTimes t =
+                BuildGpl(ctx, pipelines[i], salt_base + static_cast<uint32_t>(i), gpl_retain);
+            if (!t.ok) {
+                ++failed;
+                std::printf("%s failed\n", pipelines[i].name.c_str());
+                continue;
+            }
+            full.push_back(t.full);
+            vi.push_back(t.vi);
+            pre.push_back(t.pre);
+            frag.push_back(t.frag);
+            out.push_back(t.out);
+            link.push_back(t.link);
+            full_use.push_back(t.full_use);
+            link_use.push_back(t.link_use);
+            if (t.lto >= 0) {
+                lto.push_back(t.lto);
+            }
+            // gpl name vs-hash fs-hash layout-hash full vi pre frag out link lto full_use
+            // link_use (ms)
+            std::printf(
+                "gpl %s %016llx %016llx %016llx %.3f %.3f %.3f %.3f %.3f %.3f %.3f %.3f %.3f\n",
+                pipelines[i].name.c_str(),
+                static_cast<unsigned long long>(HashWords(pipelines[i].vs)),
+                static_cast<unsigned long long>(HashWords(pipelines[i].fs)),
+                static_cast<unsigned long long>(t.layout_hash), t.full, t.vi, t.pre, t.frag, t.out,
+                t.link, t.lto, t.full_use, t.link_use);
+        }
+        std::printf("%zu pipelines, %zu failed\n", pipelines.size(), failed);
+        Summary("full", full);
+        Summary("fulluse", full_use);
+        Summary("linkuse", link_use);
+        Summary("vi", vi);
+        Summary("pre", pre);
+        Summary("frag", frag);
+        Summary("out", out);
+        Summary("link", link);
+        Summary("lto", lto);
+        vkDestroyDevice(ctx.device, nullptr);
+        vkDestroyInstance(ctx.instance, nullptr);
+        return 0;
+    }
     std::vector<double> opt, fast;
     size_t failed = 0;
     for (size_t i = 0; i < pipelines.size(); ++i) {

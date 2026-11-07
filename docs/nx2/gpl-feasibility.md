@@ -142,18 +142,23 @@ Plain vertex+fragment pipelines (vertex A+B or B, optional fragment, no transfor
 - The vertex stage declares all 32 generic outputs at locations 0-31. Ones it does not write
   hold (0, 0, 0, 1), which the vertex prologue already stores into every declared output.
   Outputs carry no interpolation decorations, as before.
-- The fragment stage declares every generic it loads, with the same locations, types and
-  `Flat`/`NoPerspective` decorations as today (they come from the fragment program alone).
-  `previous_stage_stores`, the previous stage's legacy mapping and `per_primitive_generics`
-  no longer enter it.
+- The fragment stage declares every generic it loads that the vertex stage writes, with the
+  same locations, types and `Flat`/`NoPerspective` decorations as today (they come from the
+  fragment program alone). The previous stage's legacy mapping and `per_primitive_generics` no
+  longer enter it.
 - A fragment stage that loads legacy varyings (colours, fog, fixed-function texcoords) or
   indexes its inputs keeps the linked interface: the legacy-to-generic slot comes from the
   vertex stage's free slots, and an indexed load of an unwritten generic reads 0 in `w` today.
 
-Unwritten inputs: a fragment input the vertex stage does not write used to be a constant
-(0, 0, 0, 1); it now reads the vertex stage's default write. Flat inputs and the 0 components
-are exact. A smooth `w` is 1.0 interpolated, which is exact if the rasteriser computes
-`(1/w)/(1/w)` exactly; this is the one value to check with a frame dump.
+Unwritten inputs stay the constant (0, 0, 0, 1), as when linked. The first version declared
+them and read the vertex stage's default write instead, which is not exact: on the RTX 4060
+(615.78.08) a perspective-interpolated constant 1.0 is one ulp off in 46% of fragments
+(monolithic and fast-linked pipelines alike; `noperspective` and the 0 components are exact).
+With the constants, the fragment module of all 592 Ocarina vertex+fragment pipelines is
+byte-identical to the one linked against the pipeline's own vertex stage (the first version
+differed in the 8 that read an unwritten generic). For vertex+fragment pipelines the step
+therefore only changes the vertex stage, and the linked fragment module already depended on
+the vertex stage only through generics it reads without their being written.
 
 Kept on the linked path: tessellation, geometry (including layer emulation), mesh/task and
 transform-feedback pipelines. Resolution scaling > 1x still couples stages through the
@@ -168,9 +173,52 @@ both modes (8 lack captured storage-pointer context) and all 592 fixed pairs bui
 4060 (98.8 s total vs 96.0 s linked, same p99). Each of the 330 fragment shaders emitted after
 6 random vertex shaders gave 1-6 distinct modules linked (only 13 had one) and exactly one fixed,
 except one shader with legacy or indexed loads. 8 of the 592 cache pipelines read an unwritten
-generic: 7 flat, one smooth `w`.
+generic: 7 flat, one smooth `w`. (Random pairings overstate the coupling: in the game's own
+pipelines the vertex stage writes what the fragment stage reads, see above.)
 
 Step 3 (state to specialization constants) still has to move out of the stage SPIR-V:
 vertex `generic_input_types`, `fixed_state_point_size`, `convert_depth_mode` and `y_negate`;
 fragment alpha test, `dual_source_blend` and `force_early_z`; and the vertex stage's
 `has_geometry` dependency (point size, depth mode) for pipelines with a geometry stage.
+
+## Step 4 measured: fast linking is fast, libraries are not cheaper
+
+`pipeline_compile_bench --gpl fast|lto [--order lib-first]` builds each pair as a monolithic
+pipeline and as the four libraries (vertex input, pre-rasterization with the vertex shader,
+fragment shader, fragment output; one shared layout, no independent sets), then fast-links them
+and submits one empty draw with each result. 592 Ocarina vertex+fragment pairs from
+`vulkan.fork-v54.bin` (shader-sweep, stage bindings and fixed interfaces), RTX 4060 Laptop,
+615.78.08, `__GL_SHADER_DISK_CACHE=0`, every module salted, idle machine:
+
+| ms | total | p50 | p90 | p99 | max |
+|---|---|---|---|---|---|
+| monolithic pipeline | 93.3 s | 25.8 | 139.7 | 4999 | 5197 |
+| fast link, all four libraries present | 3 ms | 0.005 | 0.01 | 0.01 | 0.03 |
+| pre-rasterization library (vertex shader) | 28.1 s | 9.0 | 22.3 | 1465 | 1644 |
+| fragment shader library | 65.6 s | 10.9 | 127.3 | 4957 | 5269 |
+| vertex input + fragment output libraries | 6 ms | 0.01 | 0.02 | 0.03 | 0.04 |
+| link with `LINK_TIME_OPTIMIZATION` | 27.7 s | 8.7 | 22.2 | 1446 | 1560 |
+
+The first submit with a fast-linked pipeline costs the same as with a monolithic one (p50 0.9 ms
+both, max 4.7 vs 2.8 ms), so the driver does not defer the compile to first use. Building the
+libraries first, without `RETAIN_LINK_TIME_OPTIMIZATION_INFO`, gives the same picture (libraries
+29.4 + 67.6 s against 97.1 s monolithic). A library costs what its stage costs inside a
+monolithic pipeline: the driver's time is the shader compile, and GPL only saves it when the
+stage was compiled before.
+
+In cache order (roughly the order the game met them) 184 of the 592 pipelines reuse both
+stages and would need only the fast link; the other 408 need one or two new libraries. Held-draw
+time with GPL would be 82.1 s instead of 93.3 s (78.3 s building the two libraries in
+parallel), p50 14.3 ms instead of 25.8, but p90 135.6 and p99 4964 ms are unchanged. With
+independent descriptor sets (one set per stage, so the layout leaves the library key) 187
+pipelines need only a link and the total is 75.7 s. The multi-second freezes are single
+fragment shaders: the 8 slowest pipelines take 5.0-5.2 s each, all in the fragment library
+(about 107 KiB of SPIR-V each with 61 calls to a 128-bit global-memory load helper that
+matches the 64-bit address against seven storage buffers), and the top 10 pipelines
+are 47% of all compile time. GPL cannot shorten those; making those fragment shaders cheaper
+to compile (resolving the global-memory pointers to storage buffers) or not waiting for them
+can.
+
+The runtime integration was therefore not built. `VK_EXT_graphics_pipeline_library` would
+remove about 12-19% of the driver compile time behind held draws in this game and none of the
+long freezes.

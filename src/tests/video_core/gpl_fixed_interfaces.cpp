@@ -167,13 +167,47 @@ TEST_CASE("Fixed interfaces make the fragment SPIR-V independent of the vertex s
     // The linked interface depends on what the vertex shader writes.
     REQUIRE(linked_a[1] != linked_b[1]);
 
-    auto vertex_c = pool.Vertex({Attribute::PositionX, Generic(0), Generic(1)});
-    auto vertex_d = pool.Vertex({Attribute::PositionX, Generic(0), Generic(5), Generic(7)});
+    // Fixed, the module only depends on generics the fragment stage reads without their being
+    // written; with both vertex shaders writing every input, it is the same module.
+    auto vertex_c = pool.Vertex({Attribute::PositionX, Generic(0), Generic(1), Generic(5)});
+    auto vertex_d = pool.Vertex({Generic(0), Generic(1), Generic(3), Generic(5), Generic(7)});
     auto fragment_c = fragment();
     auto fragment_d = fragment();
     const auto fixed_c = EmitPipeline(vertex_c, fragment_c, true);
     const auto fixed_d = EmitPipeline(vertex_d, fragment_d, true);
     REQUIRE(fixed_c[1] == fixed_d[1]);
+}
+
+TEST_CASE("Fixed interfaces read unwritten fragment inputs as constants, as linked",
+          "[video_core][spirv][gpl]") {
+    using Shader::Interpolation;
+    Programs pool;
+    const auto fragment = [&pool] {
+        return pool.Fragment({{Generic(0), Interpolation::Smooth},
+                              {Generic(1), Interpolation::Flat},
+                              {Generic(5), Interpolation::NoPerspective}});
+    };
+    // Generic 5 is not written: it must not become an input interpolating the vertex default.
+    auto vertex_linked = pool.Vertex({Attribute::PositionX, Generic(0), Generic(1), Generic(7)});
+    auto vertex_fixed = pool.Vertex({Attribute::PositionX, Generic(0), Generic(1), Generic(7)});
+    auto fragment_linked = fragment();
+    auto fragment_fixed = fragment();
+    const auto linked = EmitPipeline(vertex_linked, fragment_linked, false);
+    const auto fixed = EmitPipeline(vertex_fixed, fragment_fixed, true);
+    REQUIRE(linked[1] == fixed[1]);
+    const std::map<u32, std::set<u32>> expected{{0, {}}, {1, {14}}};
+    REQUIRE(ReadInterface(fixed[1]).inputs == expected);
+
+    Shader::RuntimeInfo info;
+    info.previous_stage_stores.Set(Generic(0), true);
+    auto plain = fragment();
+    REQUIRE(Shader::Maxwell::UseFixedStageInterface(plain, info));
+    REQUIRE(info.previous_stage_stores.Generic(0));
+    REQUIRE_FALSE(info.previous_stage_stores.Generic(1));
+    REQUIRE_FALSE(info.previous_stage_stores.Generic(5));
+    // Generics the fragment stage does not load are declared either way.
+    REQUIRE(info.previous_stage_stores.AllComponents(Generic(2)));
+    REQUIRE(info.previous_stage_stores.AllComponents(Generic(31)));
 }
 
 TEST_CASE("Fixed interfaces keep fragment locations and interpolation",
