@@ -396,7 +396,7 @@ TEST_CASE("Handle tables are read for every element at once", "[video_core][text
         return index == 0 ? cbuf : 0;
     };
     std::vector<u32> handles;
-    VideoCommon::EvaluateTextureHandles(info, 0, memory, cbuf_address, 4,
+    VideoCommon::EvaluateTextureHandles(info, 0, memory, cbuf_address, 0, 4,
                                         [&handles](u32 element, u32 handle) {
                                             CHECK(element == handles.size());
                                             handles.push_back(handle);
@@ -405,7 +405,7 @@ TEST_CASE("Handle tables are read for every element at once", "[video_core][text
     // The entry size and the storage buffer address, once each for all the elements.
     CHECK(cbuf_reads == 2);
     for (u32 element = 0; element < 4; ++element) {
-        CHECK(VideoCommon::EvaluateTextureHandle(info, 0, memory, cbuf_address, element) ==
+        CHECK(VideoCommon::EvaluateTextureHandle(info, 0, memory, cbuf_address, 0, element) ==
               0x100 + element);
     }
 }
@@ -612,7 +612,7 @@ TEST_CASE("Dual vertex programs join the descriptors and storage buffers of both
         REQUIRE(descriptor.handle_program < info.handle_programs.size());
         return std::pair{descriptor.type,
                          VideoCommon::EvaluateTextureHandle(info, descriptor.handle_program, memory,
-                                                            cbuf_address)};
+                                                            cbuf_address, 0)};
     };
     CHECK(texture(sample_a) == std::pair{TextureType::Color2D, 0xa0U});
     CHECK(texture(volume_a) == std::pair{TextureType::Color3D, 0xa0U});
@@ -749,5 +749,38 @@ TEST_CASE("A size query of a table shares the texture array of its sample",
             CHECK(query.Flags<IR::TextureInstInfo>().descriptor_index ==
                   sample.Flags<IR::TextureInstInfo>().descriptor_index);
         }
+    }
+}
+
+TEST_CASE("Storage handle words are read from the host-aligned buffer base",
+          "[video_core][texture_handles]") {
+    // The program's storage offsets are relative to the buffer address aligned down to the host
+    // storage alignment (StorageOffset), where the buffer cache binds the buffer.
+    constexpr GPUVAddr cbuf = 0x1000;
+    HandleTestMemory memory;
+    memory.words[cbuf + 0x10] = 0x2008; // the storage buffer address, 8 bytes past 16
+    memory.words[cbuf + 0x14] = 0;
+    memory.words[0x2008] = 0x11; // the handle the shader reads
+    memory.words[0x2010] = 0x22;
+
+    Shader::Info info;
+    info.storage_buffers_descriptors.push_back({.cbuf_index = 0, .cbuf_offset = 0x10, .count = 1, .is_written = false});
+    // Offset 8 from the base aligned to 16, as StorageOffset gives it for a read at 0x2008.
+    info.handle_programs.push_back({static_cast<u32>(Shader::HandleOp::Immediate), 8U,
+                                    static_cast<u32>(Shader::HandleOp::Storage), 0U});
+    const auto cbuf_address = [](u32 index) -> GPUVAddr { return index == 0 ? cbuf : 0; };
+    CHECK(VideoCommon::EvaluateTextureHandle(info, 0, memory, cbuf_address, 16) == 0x11U);
+    CHECK(VideoCommon::EvaluateTextureHandle(info, 0, memory, cbuf_address, 4) == 0x22U);
+    CHECK(VideoCommon::EvaluateTextureHandle(info, 0, memory, cbuf_address, 0) == 0x22U);
+
+    SECTION("Indirect buffers align the address read from the table, not the table") {
+        // The constant buffer points at a table that is not aligned. The buffer address is read
+        // from the table entry at its exact address, then aligned down.
+        memory.words[cbuf + 0x10] = 0x3004;
+        memory.words[0x3004 + 0x8] = 0x2008;
+        memory.words[0x3004 + 0xc] = 0;
+        info.storage_buffers_descriptors[0].indirect_offset = 0x8;
+        CHECK(VideoCommon::EvaluateTextureHandle(info, 0, memory, cbuf_address, 16) == 0x11U);
+        CHECK(VideoCommon::EvaluateTextureHandle(info, 0, memory, cbuf_address, 4) == 0x22U);
     }
 }

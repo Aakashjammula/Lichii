@@ -21,10 +21,12 @@
 namespace VideoCommon {
 
 /// The address of storage buffer `binding` of a shader as its descriptor in a constant buffer gives
-/// it; 0 when it has none.
+/// it; 0 when it has none. storage_alignment is the host storage buffer offset alignment: storage
+/// offsets in a handle program are relative to the buffer address aligned down to it
+/// (StorageOffset), which is also where the buffer cache binds the buffer.
 template <typename Memory, typename CbufAddress>
 GPUVAddr StorageBufferBase(const Shader::Info& info, u32 binding, Memory& gpu_memory,
-                           CbufAddress& cbuf_address) {
+                           CbufAddress& cbuf_address, u64 storage_alignment) {
     if (binding >= info.storage_buffers_descriptors.size()) {
         return 0;
     }
@@ -35,18 +37,21 @@ GPUVAddr StorageBufferBase(const Shader::Info& info, u32 binding, Memory& gpu_me
     }
     GPUVAddr base{gpu_memory.template Read<u64>(cbuf + descriptor.cbuf_offset)};
     if (base != 0 && descriptor.indirect_offset != ~0U) {
+        // The table entry is read at its exact address. Only the buffer address it holds is
+        // aligned down, as the shader does.
         base = gpu_memory.template Read<u64>(base + descriptor.indirect_offset);
     }
-    return base;
+    return base & ~(GPUVAddr{(std::max)(storage_alignment, u64{1})} - 1);
 }
 
 /// The texture handle a shader reads from a storage buffer, computed from the current constant
 /// buffer and storage buffer words (Shader::Info::handle_programs). cbuf_address(index) is the
-/// bound constant buffer's address, 0 when none is bound. element is the descriptor array
-/// element, for a program computing one handle per element.
+/// bound constant buffer's address, 0 when none is bound. storage_alignment is as for
+/// StorageBufferBase. element is the descriptor array element, for a program computing one handle
+/// per element.
 template <typename Memory, typename CbufAddress>
 u32 EvaluateTextureHandle(const Shader::Info& info, u32 program, Memory& gpu_memory,
-                          CbufAddress&& cbuf_address, u32 element = 0) {
+                          CbufAddress&& cbuf_address, u64 storage_alignment, u32 element = 0) {
     return Shader::EvaluateHandleProgram(
                info.handle_programs[program],
                [&](u32 index, u32 offset) -> u32 {
@@ -54,7 +59,8 @@ u32 EvaluateTextureHandle(const Shader::Info& info, u32 program, Memory& gpu_mem
                    return base != 0 ? gpu_memory.template Read<u32>(base + offset) : 0U;
                },
                [&](u32 binding, u32 offset) -> u32 {
-                   const GPUVAddr base{StorageBufferBase(info, binding, gpu_memory, cbuf_address)};
+                   const GPUVAddr base{StorageBufferBase(info, binding, gpu_memory, cbuf_address,
+                                                         storage_alignment)};
                    return base != 0 ? gpu_memory.template Read<u32>(base + offset) : 0U;
                },
                element)
@@ -66,7 +72,8 @@ u32 EvaluateTextureHandle(const Shader::Info& info, u32 program, Memory& gpu_mem
 /// words and storage buffer addresses the program reads are read once for all the elements.
 template <typename Memory, typename CbufAddress, typename Output>
 void EvaluateTextureHandles(const Shader::Info& info, u32 program, Memory& gpu_memory,
-                            CbufAddress&& cbuf_address, u32 count, Output&& output) {
+                            CbufAddress&& cbuf_address, u64 storage_alignment, u32 count,
+                            Output&& output) {
     struct CbufWord {
         u32 index;
         u32 offset;
@@ -94,7 +101,8 @@ void EvaluateTextureHandles(const Shader::Info& info, u32 program, Memory& gpu_m
             return 0U;
         }
         if ((known_bases & (1U << binding)) == 0) {
-            bases[binding] = StorageBufferBase(info, binding, gpu_memory, cbuf_address);
+            bases[binding] =
+                StorageBufferBase(info, binding, gpu_memory, cbuf_address, storage_alignment);
             known_bases |= 1U << binding;
         }
         return bases[binding] != 0 ? gpu_memory.template Read<u32>(bases[binding] + offset) : 0U;

@@ -447,7 +447,8 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             if (desc.handle_program != ~0U) {
                 // Read by the shader from a storage buffer: computed for this draw.
                 return TexturePair(VideoCommon::EvaluateTextureHandle(
-                                       info, desc.handle_program, *gpu_memory, cbuf_address, index),
+                                       info, desc.handle_program, *gpu_memory, cbuf_address,
+                                       device.GetStorageBufferAlignment(), index),
                                    via_header_index);
             }
             ASSERT(cbufs[desc.cbuf_index].enabled);
@@ -499,8 +500,8 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                 u32 last_sampler_index{~0U};
                 VideoCommon::SamplerId sampler{};
                 VideoCommon::EvaluateTextureHandles(
-                    info, desc.handle_program, *gpu_memory, cbuf_address, desc.count,
-                    [&](u32, u32 raw) {
+                    info, desc.handle_program, *gpu_memory, cbuf_address,
+                    device.GetStorageBufferAlignment(), desc.count, [&](u32, u32 raw) {
                         const auto handle{TexturePair(raw, via_header_index)};
                         views.push_back({handle.first});
                         if (handle.second != last_sampler_index) {
