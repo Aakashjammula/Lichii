@@ -541,7 +541,9 @@ int main(int argc, char** argv) {
         bool packed_code{};
         bool capture_extent{};
         bool fixed_interfaces{};
-        std::string previous_environment;
+        bool descriptor_aliasing{};
+        u64 ssbo_alignment{};
+        std::string previous_environment, dump_ir;
         u32 binding_base{};
         for (int i = 1; i < argc; ++i) {
             const std::string arg{argv[i]};
@@ -552,6 +554,7 @@ int main(int argc, char** argv) {
                              "--cache-version 46|47|48|49|50|51|52|53]\n"
                              "  [--pipeline-key FILE] [--capture-extent] [--binding-base N] "
                              "[--previous-environment FILE] [--fixed-interfaces]\n"
+                             "  [--ssbo-alignment N] [--descriptor-aliasing] [--dump-ir FILE]\n"
                              "  (--output SPV | --lower-only WORDS | --packed-code WORDS)\n";
                 return 0;
             }
@@ -569,6 +572,10 @@ int main(int argc, char** argv) {
                 fixed_interfaces = true;
                 continue;
             }
+            if (arg == "--descriptor-aliasing") {
+                descriptor_aliasing = true;
+                continue;
+            }
             if (++i == argc)
                 throw std::runtime_error("Missing value for " + arg);
             const std::string value{argv[i]};
@@ -582,6 +589,10 @@ int main(int argc, char** argv) {
                 pipeline_key = value;
             else if (arg == "--previous-environment")
                 previous_environment = value;
+            else if (arg == "--dump-ir")
+                dump_ir = value;
+            else if (arg == "--ssbo-alignment")
+                ssbo_alignment = std::stoull(value);
             else if (arg == "--binding-base")
                 binding_base = static_cast<u32>(std::stoul(value));
             else if (arg == "--cache-version") {
@@ -762,6 +773,9 @@ int main(int argc, char** argv) {
         host.support_conditional_barrier = true;
         host.support_viewport_index_layer = true;
         host.support_geometry_shader_passthrough = true;
+        // --ssbo-alignment: the device's minStorageBufferOffsetAlignment (16 on NVIDIA).
+        host.min_ssbo_alignment = ssbo_alignment;
+        host.compact_global_loads = Shader::CompactGlobalLoadsRequested();
         host.ApplyDescriptorLimitPolicy();
         auto program = Shader::Maxwell::TranslateProgram(inst_pool, block_pool, env, cfg, host);
         if (!previous_environment.empty()) {
@@ -807,6 +821,10 @@ int main(int argc, char** argv) {
         profile.max_user_clip_distances = 8;
         profile.max_subgroup_size = 32;
         profile.support_typeless_image_loads = true;
+        profile.support_descriptor_aliasing = descriptor_aliasing;
+        if (!dump_ir.empty()) {
+            std::ofstream{dump_ir} << Shader::IR::DumpProgram(program);
+        }
         // --binding-base: the first descriptor binding, as a stage later in a pipeline gets.
         Shader::Backend::Bindings bindings{};
         bindings.unified = binding_base;

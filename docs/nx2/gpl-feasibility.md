@@ -222,3 +222,12 @@ can.
 The runtime integration was therefore not built. `VK_EXT_graphics_pipeline_library` would
 remove about 12-19% of the driver compile time behind held draws in this game and none of the
 long freezes.
+
+These numbers use shader-sweep's default offline profile (1-byte storage alignment, no
+descriptor aliasing), which splits every 128-bit global load into four routed 32-bit loads.
+With the RTX 4060's profile (`--ssbo-alignment 16 --descriptor-aliasing`) the same 592 pairs
+take 45.8 s, p99 855 ms, and the heaviest fragment pipelines about 850 ms each. Their global
+loads all go through five pointers read from a table at `*c0[0x520]`;
+`EDEN_NX2_COMPACT_GLOBAL_LOADS=1` reads such loads through the pointer's own storage buffer
+instead of routing each one among all seven bound buffers (see
+`global_memory_to_storage_buffer_pass.cpp`).

@@ -78,6 +78,10 @@ struct StorageInfo {
     std::unordered_map<const IR::Inst*, small_vector<StorageBufferAddr, 4>> native_candidates;
     /// Native accesses whose candidates include slots of a dynamically indexed pointer array.
     std::unordered_set<const IR::Inst*> native_dynamic;
+    /// Native accesses whose address search went through a phi, select or subgroup shuffle.
+    std::unordered_set<const IR::Inst*> native_branched;
+    /// Rebase accesses through a single loaded pointer on its buffer (compact_global_loads).
+    bool compact_loaded{};
     /// A native access with several candidate pointers was left global.
     bool native_runtime_bounds{};
     /// Paired accesses bind the loaded pointers that compete with their pair; cleared when those
@@ -170,6 +174,21 @@ bool IsRuntimeRoutable(const IR::Inst& inst) {
     case IR::Opcode::GlobalAtomicIAdd32:
     case IR::Opcode::GlobalAtomicUMax32:
     case IR::Opcode::GlobalAtomicCompareExchange32:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/// Returns true for the routable loads and writes compact_global_loads rebases
+bool IsCompactable(const IR::Inst& inst) {
+    switch (inst.GetOpcode()) {
+    case IR::Opcode::LoadGlobal32:
+    case IR::Opcode::LoadGlobal64:
+    case IR::Opcode::LoadGlobal128:
+    case IR::Opcode::WriteGlobal32:
+    case IR::Opcode::WriteGlobal64:
+    case IR::Opcode::WriteGlobal128:
         return true;
     default:
         return false;
@@ -1125,7 +1144,7 @@ void CollectPointerSlots(const IR::Value& offset, small_vector<std::pair<u32, u3
 /// read from an array at a dynamic offset contributes every mapped slot of the array.
 small_vector<StorageBufferAddr, 4> NativePointerCandidates(const IR::U32& low_addr,
                                                            Environment& env, bool& dynamic,
-                                                           StorageInfo& info) {
+                                                           bool& branched, StorageInfo& info) {
     small_vector<StorageBufferAddr, 4> candidates;
     small_vector<const IR::Inst*, 16> pending{low_addr.InstRecursive()};
     std::unordered_set<const IR::Inst*> visited{pending.front()};
@@ -1172,17 +1191,24 @@ small_vector<StorageBufferAddr, 4> NativePointerCandidates(const IR::U32& low_ad
             break;
         }
         case IR::Opcode::IAdd32:
+            for (size_t arg = inst->NumArgs(); arg--;) {
+                enqueue(inst->Arg(arg));
+            }
+            break;
         case IR::Opcode::Phi:
+            branched = true;
             for (size_t arg = inst->NumArgs(); arg--;) {
                 enqueue(inst->Arg(arg));
             }
             break;
         case IR::Opcode::SelectU32:
+            branched = true;
             enqueue(inst->Arg(1));
             enqueue(inst->Arg(2));
             break;
         case IR::Opcode::ShuffleIndex:
             // A pointer made uniform (R2UR broadcasts the first active lane's value).
+            branched = true;
             enqueue(inst->Arg(0));
             break;
         case IR::Opcode::CompositeExtractU32x2:
@@ -1355,16 +1381,43 @@ void CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info, 
         auto it{info.native_candidates.find(start)};
         if (it == info.native_candidates.end()) {
             bool dynamic{};
+            bool branched{};
             it = info.native_candidates
-                     .emplace(start, NativePointerCandidates(low_addr, env, dynamic, info))
+                     .emplace(start,
+                              NativePointerCandidates(low_addr, env, dynamic, branched, info))
                      .first;
             if (dynamic) {
                 info.native_dynamic.insert(start);
+            }
+            if (branched) {
+                info.native_branched.insert(start);
             }
         }
         const auto& candidates{it->second};
         const bool has_loaded_pointer{std::ranges::any_of(
             candidates, [](const StorageBufferAddr& c) { return c.indirect != ~0U; })};
+        if (info.compact_loaded && !paired_found && candidates.size() == 1 &&
+            candidates.front().indirect != ~0U && low_addr_info->imm_offset >= 0 &&
+            !info.native_branched.contains(start) && IsCompactable(inst) &&
+            std::ranges::find(info.table_candidates, candidates.front()) ==
+                info.table_candidates.end()) {
+            // The address is the one pointer loaded from a fixed slot of the holder's buffer plus
+            // offsets. The run-time routing below would pick, among all bound buffers, the one
+            // whose base is nearest at or below the address; read through this pointer's buffer
+            // instead, with the base the routing reads from the holder (see StorageOffset).
+            const StorageBufferAddr loaded{candidates.front()};
+            info.set.insert(loaded);
+            info.set.insert(StorageBufferAddr{.index = loaded.index, .offset = loaded.offset});
+            if (IsGlobalMemoryWrite(inst)) {
+                info.writes.insert(loaded);
+            }
+            info.to_replace.push_back(StorageInst{
+                .storage_buffer{loaded},
+                .inst = &inst,
+                .block = &block,
+            });
+            return;
+        }
         if (paired_found &&
             (!has_loaded_pointer || !info.bind_competing_loaded || !IsRuntimeRoutable(inst))) {
             // No pointer loaded from memory competes with the paired one, or the access cannot
@@ -1476,8 +1529,10 @@ void CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info, 
     });
 }
 
-/// Returns the offset in indices (not bytes) for an equivalent storage instruction
-IR::U32 StorageOffset(IR::Block& block, IR::Inst& inst, StorageBufferAddr buffer, u32 alignment) {
+/// Returns the offset in indices (not bytes) for an equivalent storage instruction. A buffer behind
+/// a loaded pointer takes its base from the holder's binding (holder_binding).
+IR::U32 StorageOffset(IR::Block& block, IR::Inst& inst, StorageBufferAddr buffer, u32 alignment,
+                      u32 holder_binding) {
     IR::IREmitter ir{block, IR::Block::InstructionList::s_iterator_to(inst)};
     IR::U32 offset;
     if (const std::optional<LowAddrInfo> low_addr{TrackLowAddress(&inst)}) {
@@ -1491,6 +1546,16 @@ IR::U32 StorageOffset(IR::Block& block, IR::Inst& inst, StorageBufferAddr buffer
     // Subtract the least significant 32 bits from the guest offset. The result is the storage
     // buffer offset in bytes.
     IR::U32 low_cbuf{ir.GetCbuf(ir.Imm32(buffer.index), ir.Imm32(buffer.offset))};
+    if (buffer.indirect != ~0U) {
+        // The low word of the pointer at buffer.indirect in the memory the constant buffer
+        // pointer points to, read through the holder's binding as the backend's run-time routing
+        // reads it (DefineGlobalMemoryFunctions).
+        const IR::U32 byte{ir.IAdd(ir.BitwiseAnd(low_cbuf, ir.Imm32(alignment - 1U)),
+                                   ir.Imm32(buffer.indirect))};
+        low_cbuf = IR::U32{IR::Value{&*block.PrependNewInst(
+            IR::Block::InstructionList::s_iterator_to(inst), IR::Opcode::LoadStorage32,
+            {ir.Imm32(holder_binding), byte})}};
+    }
 
     // Align the offset base to match the host alignment requirements
     low_cbuf = ir.BitwiseAnd(low_cbuf, ir.Imm32(~(alignment - 1U)));
@@ -1615,6 +1680,7 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
     StorageInfo info;
     // Without 64-bit integers the backend cannot route global accesses among bound buffers.
     info.bind_competing_loaded = host_info.support_int64;
+    info.compact_loaded = host_info.compact_global_loads;
     info.iterator_words = CollectIteratorWords(program);
     info.atomic_pointers = CollectAtomicPointers(program);
     const auto collect = [&] {
@@ -1636,6 +1702,7 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
         paired.iterator_words = std::move(info.iterator_words);
         paired.atomic_pointers = std::move(info.atomic_pointers);
         paired.bind_competing_loaded = false;
+        paired.compact_loaded = info.compact_loaded;
         info = std::move(paired);
         collect();
     }
@@ -1645,6 +1712,7 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
         with_tables.iterator_words = info.iterator_words;
         with_tables.atomic_pointers = info.atomic_pointers;
         with_tables.bind_competing_loaded = info.bind_competing_loaded;
+        with_tables.compact_loaded = info.compact_loaded;
         with_tables.tables_enabled = true;
         with_tables.table_budget = max_ssbos - info.set.size();
         with_tables.counted = info.set;
@@ -1676,8 +1744,14 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
         const IR::U32 index{IR::Value{static_cast<u32>(info.set.index_of(it))}};
         IR::Block* const block{storage_inst.block};
         IR::Inst* const inst{storage_inst.inst};
-        const IR::U32 offset{
-            StorageOffset(*block, *inst, storage_buffer, u32(host_info.min_ssbo_alignment))};
+        u32 holder_binding{};
+        if (storage_buffer.indirect != ~0U) {
+            const auto holder{info.set.find(
+                StorageBufferAddr{.index = storage_buffer.index, .offset = storage_buffer.offset})};
+            holder_binding = static_cast<u32>(info.set.index_of(holder));
+        }
+        const IR::U32 offset{StorageOffset(*block, *inst, storage_buffer,
+                                           u32(host_info.min_ssbo_alignment), holder_binding)};
         Replace(*block, *inst, index, offset);
     }
 }

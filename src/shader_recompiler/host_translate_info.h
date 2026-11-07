@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include <cstdlib>
+
 #include "common/common_types.h"
 
 namespace Shader {
@@ -42,6 +44,10 @@ struct HostTranslateInfo {
                                         ///< control flow
     bool single_lane_geometry_subgroups{};
     bool support_byte_addressed_r16{};
+    /// Native global accesses through one pointer loaded from memory use that pointer's storage
+    /// buffer instead of picking among every bound buffer at run time
+    /// (EDEN_NX2_COMPACT_GLOBAL_LOADS, see CompactGlobalLoadsRequested)
+    bool compact_global_loads{};
 
     void ApplyDescriptorLimitPolicy() noexcept {
         if (min_ssbo_alignment == 0) {
@@ -67,5 +73,14 @@ private:
         }
     }
 };
+
+/// EDEN_NX2_COMPACT_GLOBAL_LOADS=1: translate with HostTranslateInfo::compact_global_loads.
+[[nodiscard]] inline bool CompactGlobalLoadsRequested() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_COMPACT_GLOBAL_LOADS");
+        return value && value[0] == '1';
+    }();
+    return enabled;
+}
 
 } // namespace Shader

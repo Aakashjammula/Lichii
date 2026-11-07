@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <map>
 #include <optional>
 #include <vector>
 
@@ -56,6 +57,9 @@ struct KernelProgram {
     bool int64{true};
     u32 storage_buffer_limit{};     ///< The stage's storage buffer limit, none when 0
     u32 set_storage_buffer_limit{}; ///< The descriptor set's storage buffer limit, none when 0
+}
+
+    bool compact{};
 
     KernelProgram() {
         program.stage = Shader::Stage::Compute;
@@ -69,6 +73,9 @@ struct KernelProgram {
         host.support_int64 = int64;
         host.max_per_stage_descriptor_storage_buffers = storage_buffer_limit;
         host.max_descriptor_set_storage_buffers = set_storage_buffer_limit;
+}
+
+        host.compact_global_loads = compact;
         Shader::Optimization::GlobalMemoryToStorageBufferPass(env, program, host);
         std::vector<u32> offsets;
         for (const auto& descriptor : program.info.storage_buffers_descriptors) {
@@ -596,6 +603,190 @@ TEST_CASE("Pointer table entries that would overflow the storage buffers are lef
     CHECK_FALSE(fixture.program.info.native_global_bounds);
     CHECK(std::ranges::none_of(fixture.program.info.storage_buffers_descriptors,
                                [](const auto& desc) { return desc.indirect_offset != ~0U; }));
+}
+
+namespace {
+/// Evaluates the address arithmetic of a rebased program: constant buffer 0 holds the table
+/// pointer, guest memory holds the table, and each binding starts at its pointer aligned down to
+/// the storage buffer alignment, as the buffer cache binds it.
+struct AddressEvaluator {
+    std::map<u32, u32> cbuf;
+    std::map<u64, u32> memory;
+    std::vector<u64> binding_bases;
+
+    u32 Word(u64 address) const {
+        const auto it{memory.find(address)};
+        return it == memory.end() ? 0U : it->second;
+    }
+
+    std::vector<u64> Eval(const IR::Value& value) const {
+        if (value.IsImmediate()) {
+            return {value.Type() == IR::Type::U64 ? value.U64() : u64{value.U32()}};
+        }
+        const IR::Inst& inst{*value.InstRecursive()};
+        const auto arg{[&](size_t index) { return Eval(inst.Arg(index)); }};
+        switch (inst.GetOpcode()) {
+        case IR::Opcode::GetCbufU32:
+            return {cbuf.at(inst.Arg(1).U32())};
+        case IR::Opcode::GetCbufU32x2:
+            return {cbuf.at(inst.Arg(1).U32()), cbuf.at(inst.Arg(1).U32() + 4)};
+        case IR::Opcode::CompositeExtractU32x2:
+            return {arg(0).at(inst.Arg(1).U32())};
+        case IR::Opcode::CompositeConstructU32x2:
+            return {arg(0)[0], arg(1)[0]};
+        case IR::Opcode::PackUint2x32: {
+            const auto words{arg(0)};
+            return {words[0] | (words[1] << 32)};
+        }
+        case IR::Opcode::IAdd32:
+            return {static_cast<u32>(arg(0)[0] + arg(1)[0])};
+        case IR::Opcode::ISub32:
+            return {static_cast<u32>(arg(0)[0] - arg(1)[0])};
+        case IR::Opcode::BitwiseAnd32:
+            return {arg(0)[0] & arg(1)[0]};
+        case IR::Opcode::IAdd64:
+            return {arg(0)[0] + arg(1)[0]};
+        case IR::Opcode::LoadStorage32:
+        case IR::Opcode::LoadStorage64: {
+            const u64 address{binding_bases.at(arg(0)[0]) + arg(1)[0]};
+            if (inst.GetOpcode() == IR::Opcode::LoadStorage32) {
+                return {Word(address)};
+            }
+            return {Word(address), Word(address + 4)};
+        }
+        default:
+            FAIL("Unexpected opcode " << IR::NameOf(inst.GetOpcode()));
+            return {};
+        }
+    }
+
+    /// Guest address a storage access reads or writes
+    u64 StorageAddress(const IR::Inst& inst) const {
+        return binding_bases.at(Eval(inst.Arg(0))[0]) + Eval(inst.Arg(1))[0];
+    }
+};
+
+/// Native compute program reading two records through the pointers at *c0[0x110] + 0 and + 8
+struct LoadedTableProgram {
+    KernelProgram fixture;
+
+    LoadedTableProgram(bool compact, bool vector) {
+        fixture.env.native = true;
+        fixture.compact = compact;
+        IR::IREmitter ir{fixture.entry};
+        const IR::U64 table{Address(ir, Word(ir, 0x110), Word(ir, 0x114))};
+        for (const u64 slot : {0U, 8U}) {
+            const IR::Value pointer{
+                ir.LoadGlobal64(slot ? IR::U64{ir.IAdd(table, ir.Imm64(slot))} : table)};
+            const IR::U64 base{Address(ir, IR::U32{ir.CompositeExtract(pointer, 0)},
+                                       IR::U32{ir.CompositeExtract(pointer, 1)})};
+            const IR::U64 record{ir.IAdd(base, ir.Imm64(u64{0x30}))};
+            if (vector) {
+                static_cast<void>(ir.LoadGlobal128(record));
+            } else {
+                static_cast<void>(ir.LoadGlobal32(record));
+            }
+            ir.WriteGlobal32(ir.IAdd(base, ir.Imm64(u64{4})), ir.Imm32(1));
+        }
+        fixture.TrackedOffsets();
+    }
+
+    std::ptrdiff_t Count(IR::Opcode opcode) const {
+        return std::ranges::count_if(fixture.entry.Instructions(), [=](const IR::Inst& inst) {
+            return inst.GetOpcode() == opcode;
+        });
+    }
+};
+} // Anonymous namespace
+
+TEST_CASE("Compact global loads read through the loaded pointer's own buffer",
+          "[shader][storage_buffer]") {
+    // Ocarina of Time's heavy fragment shaders (0146 and its variants) read 61 records through
+    // five pointers loaded from *c0[0x520]. Routed at run time, every access compared its address
+    // with all seven bound buffers.
+    const bool vector = GENERATE(false, true);
+    const u64 table = GENERATE(u64{0x10000}, u64{0x10008});
+    const u64 pointer = GENERATE(u64{0x2'0000'0000}, u64{0x2'0000'0004}, u64{0x2'0000'004c});
+    CAPTURE(vector, table, pointer);
+    LoadedTableProgram routed{false, vector};
+    LoadedTableProgram compact{true, vector};
+
+    const auto& routed_descriptors{routed.fixture.program.info.storage_buffers_descriptors};
+    const auto& descriptors{compact.fixture.program.info.storage_buffers_descriptors};
+    REQUIRE(descriptors.size() == 3);
+    REQUIRE(routed_descriptors.size() == descriptors.size());
+    for (size_t index = 0; index < descriptors.size(); ++index) {
+        CHECK(descriptors[index].cbuf_offset == routed_descriptors[index].cbuf_offset);
+        CHECK(descriptors[index].indirect_offset == routed_descriptors[index].indirect_offset);
+        CHECK(descriptors[index].is_written == routed_descriptors[index].is_written);
+    }
+    CHECK(routed.fixture.program.info.native_global_bounds);
+    CHECK_FALSE(compact.fixture.program.info.native_global_bounds);
+    const IR::Opcode load{vector ? IR::Opcode::LoadGlobal128 : IR::Opcode::LoadGlobal32};
+    const IR::Opcode storage{vector ? IR::Opcode::LoadStorage128 : IR::Opcode::LoadStorage32};
+    CHECK(routed.Count(load) == 2);
+    CHECK(compact.Count(load) == 0);
+    CHECK(compact.Count(IR::Opcode::WriteGlobal32) == 0);
+    CHECK(compact.Count(IR::Opcode::WriteStorage32) == 2);
+
+    AddressEvaluator eval;
+    eval.cbuf = {{0x110, static_cast<u32>(table)}, {0x114, static_cast<u32>(table >> 32)}};
+    const std::array pointers{pointer, pointer + 0x1'0000'0120};
+    for (size_t slot = 0; slot < pointers.size(); ++slot) {
+        eval.memory[table + slot * 8] = static_cast<u32>(pointers[slot]);
+        eval.memory[table + slot * 8 + 4] = static_cast<u32>(pointers[slot] >> 32);
+    }
+    for (const auto& descriptor : descriptors) {
+        const u64 bound{descriptor.indirect_offset == ~0U
+                            ? table
+                            : pointers.at(descriptor.indirect_offset / 8)};
+        eval.binding_bases.push_back(bound & ~u64{15});
+    }
+    std::vector<u64> loads;
+    std::vector<u64> writes;
+    for (const IR::Inst& inst : compact.fixture.entry.Instructions()) {
+        if (inst.GetOpcode() == storage) {
+            loads.push_back(eval.StorageAddress(inst));
+        } else if (inst.GetOpcode() == IR::Opcode::WriteStorage32) {
+            writes.push_back(eval.StorageAddress(inst));
+        }
+    }
+    // With 32-bit records the storage loads include the bases read from the table.
+    std::erase_if(loads, [&](u64 address) { return address < pointer; });
+    CHECK(loads == std::vector<u64>{pointers[0] + 0x30, pointers[1] + 0x30});
+    CHECK(writes == std::vector<u64>{pointers[0] + 4, pointers[1] + 4});
+}
+
+TEST_CASE("Compact global loads keep run-time routing for selected or lower addresses",
+          "[shader][storage_buffer]") {
+    const int form = GENERATE(0, 1, 2);
+    CAPTURE(form);
+    KernelProgram fixture;
+    fixture.env.native = true;
+    fixture.compact = true;
+    IR::IREmitter ir{fixture.entry};
+    const IR::U64 table{Address(ir, Word(ir, 0x110), Word(ir, 0x114))};
+    const IR::Value first{ir.LoadGlobal64(table)};
+    const IR::U32 first_low{ir.CompositeExtract(first, 0)};
+    const IR::U32 first_high{ir.CompositeExtract(first, 1)};
+    const IR::U1 lane_low{ir.ILessThan(ir.LocalInvocationIdX(), ir.Imm32(16), false)};
+    IR::U64 address;
+    if (form == 0) {
+        // One of two loaded pointers
+        const IR::Value second{ir.LoadGlobal64(ir.IAdd(table, ir.Imm64(u64{8})))};
+        address = Address(ir, IR::U32{ir.Select(lane_low, first_low, ir.CompositeExtract(second, 0))},
+                          IR::U32{ir.Select(lane_low, first_high, ir.CompositeExtract(second, 1))});
+    } else if (form == 1) {
+        // A loaded pointer or another value
+        address = Address(ir, IR::U32{ir.Select(lane_low, first_low, ir.Imm32(0x40))}, first_high);
+    } else {
+        // Below the loaded pointer
+        address = ir.IAdd(Address(ir, first_low, first_high), ir.Imm64(static_cast<u64>(-16)));
+    }
+    static_cast<void>(ir.LoadGlobal128(address));
+    fixture.TrackedOffsets();
+    CHECK(fixture.program.info.native_global_bounds);
+    CHECK(fixture.entry.back().GetOpcode() == IR::Opcode::LoadGlobal128);
 }
 
 TEST_CASE("NVN fallback descriptors use guest slots rather than compact binding indices",
