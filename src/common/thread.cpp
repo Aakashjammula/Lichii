@@ -800,10 +800,66 @@ void PinCurrentThread(PinnedRole role) {
     if (!ids.empty()) {
         SelectCurrentThreadCpuSets(ids);
     }
+#elif defined(__linux__) && !defined(__ANDROID__)
+    // The Windows plan on Linux: SMT siblings from sysfs, the P-cores from cpu_core when hybrid.
+    struct PinnedMasks {
+        cpu_set_t front{};
+        cpu_set_t back{};
+        cpu_set_t guest{};
+        bool valid = false;
+    };
+    static const PinnedMasks pinned = [] {
+        PinnedMasks result;
+        cpu_set_t allowed{};
+        if (sched_getaffinity(getpid(), sizeof(allowed), &allowed) != 0) {
+            return result;
+        }
+        cpu_set_t performance{};
+        const bool hybrid = ReadCpuSet("/sys/devices/cpu_core/cpus", allowed, performance);
+        std::vector<LogicalProcessor> processors;
+        for (u32 cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+            if (!CPU_ISSET(cpu, &allowed)) {
+                continue;
+            }
+            std::ifstream file("/sys/devices/system/cpu/cpu" + std::to_string(cpu) +
+                               "/topology/thread_siblings_list");
+            std::string list;
+            const auto siblings = file && std::getline(file, list) ? Common::ParseCpuList(list)
+                                                                    : std::vector<u32>{};
+            const u32 core = siblings.empty() ? cpu : *std::ranges::min_element(siblings);
+            const u8 efficiency_class = !hybrid || CPU_ISSET(cpu, &performance) ? 1 : 0;
+            processors.push_back({cpu, core, efficiency_class});
+        }
+        const GpuThreadPinning plan = PlanGpuThreadPinning(processors);
+        if (plan.front.empty()) {
+            LOG_WARNING(Common,
+                        "GPU thread pinning skipped: {} physical performance cores, needs {}",
+                        plan.performance_cores, MinCoresForGpuThreadPinning);
+            return result;
+        }
+        for (const auto& [ids, mask] : {std::pair{&plan.front, &result.front},
+                                        std::pair{&plan.back, &result.back},
+                                        std::pair{&plan.guest, &result.guest}}) {
+            for (const u32 id : *ids) {
+                CPU_SET(id, mask);
+            }
+        }
+        result.valid = true;
+        LOG_INFO(Common,
+                 "GPU thread pinning: front and back on a physical core each, guest cores on the "
+                 "other {} performance cores ({} logical processors)",
+                 plan.performance_cores - 2, plan.guest.size());
+        return result;
+    }();
+    if (pinned.valid) {
+        SetLinuxAffinity(role == PinnedRole::GpuFront  ? pinned.front
+                         : role == PinnedRole::GpuBack ? pinned.back
+                                                       : pinned.guest);
+    }
 #else
     (void)role;
     [[maybe_unused]] static const bool logged = [] {
-        LOG_INFO(Common, "GPU thread pinning is only supported on Windows");
+        LOG_INFO(Common, "GPU thread pinning is not supported on this platform");
         return true;
     }();
 #endif
