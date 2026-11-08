@@ -1108,36 +1108,6 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
             return;
         }
 
-        if (key.state.dynamic_vertex_input != 0) {
-            // Records from before version 55 keep every attribute register's type; mask them as
-            // CurrentGraphicsPipeline does, so their pipelines are found again. Newer records are
-            // already masked.
-            std::array<u64, Maxwell::MaxShaderProgram> attribute_masks{};
-            size_t env_index = 0;
-            for (size_t stage = 0; stage < Maxwell::MaxShaderProgram; ++stage) {
-                if (key.unique_hashes[stage] == 0) {
-                    continue;
-                }
-                if (env_index >= envs.size()) {
-                    return;
-                }
-                const FileEnvironment& env = envs[env_index++];
-                attribute_masks[stage] = ~u64{0};
-                if (env.ShaderStage() == Shader::Stage::VertexB && env.IsNativeProgram()) {
-                    std::array<std::array<bool, 4>, Maxwell::NumVertexAttributes> input_generic{};
-                    for (size_t index = 0; index < input_generic.size(); ++index) {
-                        input_generic[index] = env.SPH().vtg.InputGeneric(index);
-                    }
-                    attribute_masks[stage] = VideoCommon::VertexAttributeMask(input_generic);
-                } else if (env.ShaderStage() == Shader::Stage::Task ||
-                           env.ShaderStage() == Shader::Stage::Mesh) {
-                    attribute_masks[stage] = 0;
-                }
-            }
-            key.state.attribute_types = VideoCommon::KeyedAttributeTypes(
-                key.state.attribute_types, key.unique_hashes, attribute_masks);
-        }
-
         const bool key_requests_provoking_last = key.state.provoking_vertex_last != 0;
         if (key_requests_provoking_last && !dynamic_features.has_provoking_vertex_last_mode) {
             return;
