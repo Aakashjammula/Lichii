@@ -20,18 +20,29 @@ Visit the [official Lichii website](https://lichii.zortos.me) to find games and 
 
 ## This fork: Ocarina of Time on Linux (branch `oot-latest`)
 
-This fork tracks [zortos293/Lichii](https://github.com/zortos293/Lichii) and adds fixes and tuning for **The Legend of Zelda: Ocarina of Time** (`0400486024DEC000`) on **Linux with NVIDIA** hybrid laptops. It was tested on an i7-12700H with an RTX 4060 Laptop GPU, a 180 Hz external monitor and CachyOS. Every change is opt-in through an environment switch. With all switches unset, the build behaves like zortos's code, except for the shader fix, which is always on.
+This fork tracks [zortos293/Lichii](https://github.com/zortos293/Lichii) and adds fixes and tuning for **The Legend of Zelda: Ocarina of Time** (`0400486024DEC000`) on **Linux with NVIDIA** laptops. It is tested on an ASUS TUF F15: i7-12700H, RTX 4060 Laptop GPU (8 GB), 16 GB RAM, CachyOS.
 
-Results in Ocarina on that machine, in areas already visited: **52–60 fps** with even frame pacing. The first visit to a new area, boss or cutscene still stutters while its shaders compile (see *Known issues*).
+Results on that machine, same route in Hyrule Field, both builds PGO:
 
-### Build (Linux)
+| Build | Median fps | Worst 10% |
+|---|---|---|
+| Upstream release, build 117 (PGO) | 46.4 | 31.8 |
+| **This branch (PGO)** | **49.9** | **42.5** |
+
+The first visit to a new area, boss or cutscene still stutters while its shaders compile (see *Known issues*).
+
+### Build (Linux, PGO)
+
+Build with upstream's Linux PGO profile, as the release builds do. It needs clang 23 (the profile's LLVM version) and `lld`.
 
 ```sh
 git clone -b oot-latest https://github.com/Aakashjammula/Lichii.git && cd Lichii
+P="-fprofile-use=$PWD/eglantine.profdata -Wno-backend-plugin -Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date"
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
-      -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DYUZU_TESTS=ON
-cmake --build build
-./build/bin/tests        # optional: unit tests
+      -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+      "-DCMAKE_C_FLAGS=$P" "-DCMAKE_CXX_FLAGS=$P" -DCMAKE_EXE_LINKER_FLAGS=-fuse-ld=lld \
+      -DENABLE_WERROR=OFF
+cmake --build build --parallel 6   # 6 jobs: more can run a 16 GB machine out of memory
 ```
 
 ### Play
@@ -40,39 +51,62 @@ cmake --build build
 
 | Command | What it does |
 |---|---|
-| `./oot.sh pace` | **Recommended.** Frame pacing locked to your display's refresh rate (read from `xrandr`), plus the occlusion fix and async shader discard |
-| `./oot.sh pace30` | Same, locked at a low-latency 30 fps |
-| `./oot.sh new` | The newer opt-in optimizations, without frame pacing |
-| `./oot.sh` | Baseline tuned settings |
-| `./oot.sh --perf` | Baseline settings with `perf` CPU sampling (output in `~/lichii-perf/`) |
+| `EDEN_NX2_COMPACT_GLOBAL_LOADS=1 ./oot.sh` | **Recommended.** Tuned settings plus faster-compiling shaders |
+| `./oot.sh` | Tuned settings |
+| `./oot.sh upstream` | Only switches upstream also has, to compare this branch with upstream |
+| `./oot.sh pace` / `pace30` | Optional: display-locked frame pacing at 60 or 30 fps (adds async shader discard, so new objects can pop in) |
+| `./oot.sh --perf` | Tuned settings with `perf` CPU sampling (output in `~/lichii-perf/`) |
 
-Recommended emulator settings:
-- **GPU mode Fast.** Accurate turns off the split GPU thread.
-- **Asynchronous shaders and asynchronous presentation on.**
+`LICHII_BIN=<path> ./oot.sh` runs another build with the same settings, for example the upstream release AppImage.
+
+Recommended emulator settings (Emulation → Configure → Graphics):
+- **Vulkan, resolution 1x, window filter Bilinear, anti-aliasing None.** The GPU is close to its limit at 1x.
+- **Ocarina of Time anti-aliasing: No sharpening.** Skips the game's sharpening network, which is faster and removes edge halos. It does nothing while NVIDIA DLSS is on.
+- **NVIDIA DLSS off.** It leaves white streaks at night.
+- **GPU mode Fast**, **asynchronous shaders** and **asynchronous presentation** on. Accurate turns off the split GPU thread.
 - **Graphics → Extras → "Pin GPU threads to their own cores"** on hybrid Intel CPUs.
+- Add-ons **Max Resolution** and **Dynamic FPS** on (both built in and on by default).
+
+### 16 GB machines
+
+The game fills its 12 GiB of console RAM, so Lichii needs more memory than a 16 GB laptop has. zram compresses this memory only about 2x. Add a swap file on the SSD with a higher priority than zram, so the game's cold memory goes there:
+
+```sh
+sudo fallocate -l 16G /swapfile && sudo chmod 600 /swapfile && sudo mkswap /swapfile
+sudo swapon --priority 200 /swapfile
+echo '/swapfile none swap defaults,pri=200 0 0' | sudo tee -a /etc/fstab
+```
+
+Close heavy programs while playing. In this repository, `.clangd` with `Index: Background: Skip` keeps a background C++ indexer from taking 4–7 GB.
 
 ### What this fork adds
 
-| Switch | Effect |
+| Change | Effect |
 |---|---|
-| *(always on)* | Ocarina's texture-gather shaders with offsets that can't be proven constant now lower instead of being rejected. Without this the 3D scene was black. |
-| `EDEN_NX2_TC_MIN_AGE=3600` | Stops the texture cache from evicting and re-uploading textures unused for about one second |
-| `EDEN_NX2_PRELOAD_ALL_PIPELINES=1`, `EDEN_NX2_PIPELINE_EVICT_FRAMES=0` | Builds every cached pipeline at boot and never evicts built pipelines mid-session |
-| `EDEN_NX2_FS_READ_MBPS=0` | Removes the emulated 40 MB/s game-card read limit, which froze area loads |
-| `EDEN_NX2_FAST_DRAIN=1` | Fewer waits between the split GPU threads (port of Frizti's drain work) |
-| `EDEN_NX2_LINUX_THREAD_PLACEMENT=1` | Linux hybrid CPUs: guest and GPU threads on P-cores, shader compiles on E-cores (fights went from about 19 to 37–52 fps) |
+| *(always on)* Texture-gather shaders | Ocarina's gathers with offsets that can't be proven constant are lowered instead of rejected. Without this the 3D scene was black. |
+| *(always on)* Cache work | GPU-write invalidations skip pages with nothing cached (thibaut), and read traps arm only pages not armed yet (Kajcsi) |
+| *(always on)* Dynamic FPS | The game keeps real speed down to 10 fps (CTGL) |
+| `EDEN_NX2_COMPACT_GLOBAL_LOADS=1` | Global loads through one loaded pointer read that pointer's buffer, so Ocarina's slowest shaders compile 5–7x faster |
+| `EDEN_NX2_LINUX_THREAD_PLACEMENT=1` | Linux hybrid CPUs: guest and GPU threads on P-cores, shader compiles on E-cores |
+| `EDEN_NX2_FAST_DRAIN=1` | Fewer waits between the split GPU threads |
+| `EDEN_NX2_FS_READ_MBPS=<n>` | Forces the emulated game-card read speed (upstream now leaves Switch 2 titles unthrottled) |
 | `pin_gpu_threads` setting | Linux implementation of zortos #418: the GPU front and back threads each get a physical core |
-| `EDEN_NX2_HOST_PACE=1` + `EDEN_NX2_DISPLAY_HZ` | Frizti's display-locked frame pacer, made to work on Linux, where the refresh rate is passed in because there is no compositor query |
+| `EDEN_NX2_HOST_PACE=1` + `EDEN_NX2_DISPLAY_HZ` | Frizti's display-locked frame pacer, made to work on Linux, where the refresh rate is passed in |
 | `EDEN_NX2_OCCLUSION_READ_WAIT=1` | Waits only for the occlusion report a macro read overlaps. Fixes flickering rocks without zortos #215's 15 fps cost; #215 is reverted on this branch |
-| `EDEN_NX2_ASYNC_DISCARD=1` | Skips a draw whose pipeline isn't built yet, so the object pops in late instead of the game and audio freezing |
+| `EDEN_NX2_ASYNC_DISCARD=1` | Skips a draw whose pipeline isn't built yet, so the object pops in late instead of the game freezing |
+| `EDEN_NX2_OOT_MOVIE_COPY=0` | Runs Ocarina's movie network natively instead of zortos #721's input copy |
 | `EDEN_NX2_CLAIM_HELD_BUILD=1`, `EDEN_NX2_FRONT_REPORT_READS=1`, `EDEN_NX2_UNSAFE_TIC_READ=1` | Smaller stall reductions (zortos #321, an idea from #243, Keeflo541/Zeus) |
 | `EDEN_NX2_GPL_STAGE_BINDINGS=1`, `EDEN_NX2_GPL_FIXED_INTERFACES=1` | Work in progress: VK_EXT_graphics_pipeline_library steps 1–2 (see `docs/nx2/gpl-feasibility.md`). Off by default. |
 
+Switches that hurt on an 8 GB GPU with 16 GB of RAM (off in `oot.sh`):
+- `EDEN_NX2_TC_MIN_AGE=3600` kept 18.7 GB of textures, spilled 11 GB into system RAM, drew unbacked (black) textures and got Lichii OOM-killed.
+- `EDEN_NX2_PRELOAD_ALL_PIPELINES=1` and `EDEN_NX2_PIPELINE_EVICT_FRAMES=0` hold every pipeline, about 2 GB.
+
 ### Known issues
 
-- **First-time stutter.** Each new shader takes the NVIDIA driver about 65 ms, and up to 3 s, to compile. Async discard hides most of it, but big new scenes still hitch, and audio cuts out during those hitches. The structural fix is graphics pipeline library steps 3–4, which are in progress.
+- **First-time stutter.** New shaders are translated on the GPU thread before the driver compiles them, so a new area can drop to a few fps for several seconds. Later visits are smooth once the shaders are cached.
+- **Water and window reflections flicker** (zortos #340). zortos #354 fixes them but drew foreground foliage as sky-coloured holes, so it is not on this branch.
 - With the GPL switches on, a brief lighting glitch has been seen during cutscene freezes. Keep those switches off for normal play.
-- The shader cache version is 54, so caches from public builds (53) are not used.
 
 ## Downloads and setup
 
