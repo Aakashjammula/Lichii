@@ -12,11 +12,15 @@ cd "$(dirname "$0")"
 #   LICHII_BIN=~/Applications/lichii-pgo-117/lichii-pgo.AppImage ./oot.sh).
 LICHII_BIN="${LICHII_BIN:-./build/bin/lichii}"
 
-export EDEN_NX2_PRELOAD_ALL_PIPELINES=1     # build every cached shader at boot
-export EDEN_NX2_PIPELINE_EVICT_FRAMES=0     # never drop built shaders mid-session
+# Off on this 16 GB laptop: holding every pipeline cost ~2 GB, and with the game's 12 GB of
+# console RAM Lichii was OOM-killed when the 3D world loaded.
+# export EDEN_NX2_PRELOAD_ALL_PIPELINES=1   # build every cached shader at boot
+# export EDEN_NX2_PIPELINE_EVICT_FRAMES=0   # never drop built shaders mid-session (same reason)
 export EDEN_NX2_FS_READ_MBPS=0              # no artificial 40 MB/s game-file read limit
 export EDEN_NX2_FAST_DRAIN=1                # fewer waits between the two GPU threads
-export EDEN_NX2_TC_MIN_AGE=3600             # keep textures used in the last ~minute (no re-upload thrash)
+# Off: it kept 9,581 textures (18.7 GB) with an 8 GB GPU, spilled 11 GB into system RAM, made
+# unbacked (black) textures and got Lichii OOM-killed.
+# export EDEN_NX2_TC_MIN_AGE=3600           # keep textures used in the last ~minute (no re-upload thrash)
 export EDEN_NX2_LINUX_THREAD_PLACEMENT=1    # game/GPU threads on P-cores, compiles on E-cores (fights 19 -> 37-52 fps)
 export EDEN_NX2_TC_LOG=1                    # texture cache summary every 600 frames (cheap)
 export EDEN_DKB_FRAME_TRACE=1               # sampled frame timing (cheap)
