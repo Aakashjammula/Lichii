@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <thread>
 
+#include "common/settings.h"
 #include "core/file_sys/errors.h"
 #include "core/hle/service/cmif_serialization.h"
 #include "core/hle/service/filesystem/fsp/fs_i_storage.h"
@@ -36,14 +37,18 @@ Result IStorage::Read(
     R_UNLESS(length >= 0, FileSys::ResultInvalidSize);
     R_UNLESS(offset >= 0, FileSys::ResultInvalidOffset);
 
-    // Custom (EDEN_NX2_FS_READ_MBPS=<n>): the emulated storage speed in MB/s for this read
-    // throttle (default 40). 0 turns it off. Ocarina of Time streams its opening video with
-    // hundreds of 64 KiB reads a second on the thread that also returns decoder images, so at
-    // 40 MB/s that thread sleeps most of the time and the video falls seconds behind its audio.
-    static const s64 bytes_per_second = [] {
+    // The 40 MB/s throttle emulates a Switch 1 card (Eden cbd4cf2d8c, Mario Strikers' intro).
+    // Switch 2 storage is many times faster, and a Switch 2 title that streams a movie with
+    // hundreds of reads a second (Ocarina of Time's opening: 300-460) sleeps most of each second
+    // on the thread that also hands decoder images back, so its video falls seconds behind.
+    // Custom (EDEN_NX2_FS_READ_MBPS=<n>): force the throttle to n MB/s for any title; 0 turns it off.
+    static const s64 forced_bytes_per_second = [] {
         const char* value = std::getenv("EDEN_NX2_FS_READ_MBPS");
-        return value != nullptr ? std::strtoll(value, nullptr, 10) * 1'000'000 : ReadBytesPerSecond;
+        return value != nullptr ? std::strtoll(value, nullptr, 10) * 1'000'000 : s64{-1};
     }();
+    const s64 bytes_per_second = forced_bytes_per_second >= 0 ? forced_bytes_per_second
+                                 : Settings::CurrentProgramIsSwitch2() ? 0
+                                                                       : ReadBytesPerSecond;
     if (bytes_per_second > 0) {
         const auto now = std::chrono::steady_clock::now();
         if (now < next_read_tick) {
