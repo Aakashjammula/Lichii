@@ -776,6 +776,7 @@ int main(int argc, char** argv) {
         // --ssbo-alignment: the device's minStorageBufferOffsetAlignment (16 on NVIDIA).
         host.min_ssbo_alignment = ssbo_alignment;
         host.compact_global_loads = Shader::CompactGlobalLoadsRequested();
+        host.support_handle_table_arrays = true;
         host.ApplyDescriptorLimitPolicy();
         auto program = Shader::Maxwell::TranslateProgram(inst_pool, block_pool, env, cfg, host);
         if (!previous_environment.empty()) {
@@ -826,6 +827,8 @@ int main(int argc, char** argv) {
             std::ofstream{dump_ir} << Shader::IR::DumpProgram(program);
         }
         // --binding-base: the first descriptor binding, as a stage later in a pipeline gets.
+        // Handle table arrays are indexed per invocation, as with Vulkan.
+        profile.support_sampled_image_array_nonuniform_indexing = true;
         Shader::Backend::Bindings bindings{};
         bindings.unified = binding_base;
         const auto spirv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime, program, bindings);
