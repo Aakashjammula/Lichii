@@ -15,7 +15,6 @@ add_executable(tests
     video_core/gpu_timestamp.cpp
     core/nx2_streamplay.cpp
     core/nx2_video_ready.cpp
-    core/general_channel.cpp
     core/nx2_debug_server.cpp
     core/nx2_present_pacer.cpp
     common/dkb_cpu_trace.cpp
@@ -69,9 +68,6 @@ add_executable(tests
     video_core/gpl_fixed_interfaces.cpp
     video_core/gpl_stage_bindings.cpp
     video_core/pipeline_build.cpp
-    video_core/oot_network.cpp
-    video_core/page_filter.cpp
-    video_core/pipeline_cache_policy.cpp
     video_core/pipeline_optimization.cpp
     video_core/spirv_atomic_retry.cpp
     video_core/spirv_storage_alignment.cpp
