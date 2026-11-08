@@ -5,12 +5,23 @@
 #   ./oot.sh pace     proven settings + Frizti display-locked frame pacing (60 FPS)
 #   ./oot.sh pace30   same, locked low-latency 30 FPS
 #   ./oot.sh --perf   proven settings while perf samples the CPU (data in ~/lichii-perf/)
+#   ./oot.sh upstream only switches upstream build 117 also has (none of this branch's)
 set -euo pipefail
 cd "$(dirname "$0")"
 
 # LICHII_BIN=<path> runs another build with the same settings (e.g. the upstream PGO release:
 #   LICHII_BIN=~/Applications/lichii-pgo-117/lichii-pgo.AppImage ./oot.sh).
 LICHII_BIN="${LICHII_BIN:-./build/bin/lichii}"
+
+if [[ "${1:-}" == upstream ]]; then
+    # Compares this branch with upstream: no EDEN_NX2_FS_READ_MBPS, FAST_DRAIN,
+    # LINUX_THREAD_PLACEMENT or COMPACT_GLOBAL_LOADS; only logging.
+    unset EDEN_NX2_COMPACT_GLOBAL_LOADS
+    export EDEN_NX2_TC_LOG=1                    # texture cache summary every 600 frames (cheap)
+    export EDEN_DKB_FRAME_TRACE=1               # sampled frame timing (cheap)
+    export __GL_SHADER_DISK_CACHE_SIZE=10737418240
+    exec "$LICHII_BIN"
+fi
 
 # Off on this 16 GB laptop: holding every pipeline cost ~2 GB, and with the game's 12 GB of
 # console RAM Lichii was OOM-killed when the 3D world loaded.
