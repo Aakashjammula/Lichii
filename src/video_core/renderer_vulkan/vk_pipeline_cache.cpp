@@ -25,6 +25,7 @@
 #include "common/scope_exit.h"
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
+#include "common/memory_detect.h"
 #include "common/thread_worker.h"
 #include "core/core.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
@@ -39,6 +40,7 @@
 #include "video_core/memory_manager.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/pipeline_cache_files.h"
+#include "video_core/pipeline_cache_policy.h"
 #include "video_core/renderer_vulkan/async_draw_policy.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
 #include "video_core/renderer_vulkan/mesh_fallback_limits.h"
@@ -820,7 +822,25 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
         current_pipeline = nullptr;
         return nullptr;
     }
+    if (dynamic_features.has_dynamic_vertex_input) {
+        graphics_key.state.attribute_types = vertex_attribute_types;
+    }
     graphics_key.state.Refresh(*maxwell3d, dynamic_features);
+    if (dynamic_features.has_dynamic_vertex_input) {
+        // Refresh only rewrites the types when the vertex input changes, so the masked copy in the
+        // key must not carry over to the next program. Types of attributes the program doesn't
+        // read would split its pipelines by whatever the game left in those registers (Ocarina
+        // of Time: up to 20 keys for the same shaders, each built again in a later session).
+        vertex_attribute_types = graphics_key.state.attribute_types;
+        std::array<u64, Maxwell::MaxShaderProgram> attribute_masks{};
+        for (size_t stage = 0; stage < Maxwell::MaxShaderProgram; ++stage) {
+            if (graphics_key.unique_hashes[stage] != 0) {
+                attribute_masks[stage] = shader_infos[stage]->vertex_attribute_mask;
+            }
+        }
+        graphics_key.state.attribute_types = VideoCommon::KeyedAttributeTypes(
+            vertex_attribute_types, graphics_key.unique_hashes, attribute_masks);
+    }
 
     if (current_pipeline) {
         GraphicsPipeline* const next{current_pipeline->Next(graphics_key)};
@@ -1088,6 +1108,36 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
             (key.state.dynamic_vertex_input != 0) !=
                 dynamic_features.has_dynamic_vertex_input) {
             return;
+        }
+
+        if (key.state.dynamic_vertex_input != 0) {
+            // Records from before version 55 keep every attribute register's type; mask them as
+            // CurrentGraphicsPipeline does, so their pipelines are found again. Newer records are
+            // already masked.
+            std::array<u64, Maxwell::MaxShaderProgram> attribute_masks{};
+            size_t env_index = 0;
+            for (size_t stage = 0; stage < Maxwell::MaxShaderProgram; ++stage) {
+                if (key.unique_hashes[stage] == 0) {
+                    continue;
+                }
+                if (env_index >= envs.size()) {
+                    return;
+                }
+                const FileEnvironment& env = envs[env_index++];
+                attribute_masks[stage] = ~u64{0};
+                if (env.ShaderStage() == Shader::Stage::VertexB && env.IsNativeProgram()) {
+                    std::array<std::array<bool, 4>, Maxwell::NumVertexAttributes> input_generic{};
+                    for (size_t index = 0; index < input_generic.size(); ++index) {
+                        input_generic[index] = env.SPH().vtg.InputGeneric(index);
+                    }
+                    attribute_masks[stage] = VideoCommon::VertexAttributeMask(input_generic);
+                } else if (env.ShaderStage() == Shader::Stage::Task ||
+                           env.ShaderStage() == Shader::Stage::Mesh) {
+                    attribute_masks[stage] = 0;
+                }
+            }
+            key.state.attribute_types = VideoCommon::KeyedAttributeTypes(
+                key.state.attribute_types, key.unique_hashes, attribute_masks);
         }
 
         const bool key_requests_provoking_last = key.state.provoking_vertex_last != 0;
@@ -1406,49 +1456,58 @@ void PipelineCache::EvictUnusedPipelines() {
         return;
     }
     // Each built pipeline holds ~0.45 MB of driver memory and none was ever destroyed, so it grew
-    // with every place a session went (title 1: 1,500 on its title screen alone). One unused for
-    // this long is destroyed; it takes 2-3 ms to build again from the driver's pipeline cache.
-    // Re-entering an area needs hundreds at once, so EDEN_NX2_PIPELINE_EVICT_FRAMES=<n> changes
-    // the window and 0 keeps every pipeline (zortos293/Lichii#293).
+    // with every place a session went (title 1: 1,500 on its title screen alone). Past a budget of
+    // 1/16 of host RAM, the least recently used ones unused for this long are destroyed. Below it
+    // none are: an area coming back needs hundreds at once (Ocarina of Time: 2-3 s of draws held
+    // per 10 s), and each takes 2-3 ms to build again even from the driver's pipeline cache.
+    // EDEN_NX2_PIPELINE_EVICT_FRAMES=<n> changes the window and 0 keeps every pipeline
+    // (zortos293/Lichii#293).
     static const u64 EvictAfterFrames = [] {
         const char* value = std::getenv("EDEN_NX2_PIPELINE_EVICT_FRAMES");
         return value != nullptr ? std::strtoull(value, nullptr, 10) : u64{9000};
     }();
-    if (EvictAfterFrames == 0 || frame_count <= EvictAfterFrames) {
+    static const size_t budget =
+        VideoCommon::GraphicsPipelineBudget(Common::GetMemInfo().TotalPhysicalMemory);
+    if (EvictAfterFrames == 0 || frame_count <= EvictAfterFrames ||
+        graphics_cache.size() <= budget) {
         return;
     }
     const u64 cutoff = frame_count - EvictAfterFrames;
-    const u64 tick = scheduler.CurrentTick();
     // ~0.9 GB of driver memory at ~0.45 MB each.
     constexpr size_t MaxUnusedPrebuiltPipelines = 2000;
     size_t kept_prebuilt = 0;
-    size_t evicted = 0;
-    for (auto it = graphics_cache.begin(); it != graphics_cache.end();) {
-        GraphicsPipeline* const pipeline = it->second.get();
-        if (pipeline == nullptr || pipeline == current_pipeline || !pipeline->IsBuilt() ||
+    std::vector<std::pair<u64, GraphicsPipelineCacheKey>> candidates;
+    for (const auto& [key, pipeline] : graphics_cache) {
+        if (pipeline == nullptr || pipeline.get() == current_pipeline || !pipeline->IsBuilt() ||
             pipeline->LastUse() >= cutoff) {
-            ++it;
             continue;
         }
         // A pipeline built from the disk cache at boot that no draw has used yet stays, up to a
-        // budget: evicting it throws the prebuild away, and the game translates it again on the
-        // GPU thread when it reaches that content (OoT: 1174 of 1346 evicted on the title screen,
-        // 684 rebuilt in 10 s on entering the field). Past the budget they go like the rest, so a
-        // large cache can't hold their driver memory for the whole session.
+        // cap: evicting it throws the prebuild away, and the game translates it again on the GPU
+        // thread when it reaches that content (OoT: 1174 of 1346 evicted on the title screen, 684
+        // rebuilt in 10 s on entering the field). Past the cap they go like the rest, so a large
+        // cache can't hold their driver memory for the whole session.
         if (!pipeline->WasUsed() && kept_prebuilt < MaxUnusedPrebuiltPipelines) {
             ++kept_prebuilt;
-            ++it;
             continue;
         }
-        if (used_this_session.erase(pipeline) != 0) {
+        candidates.emplace_back(pipeline->LastUse(), key);
+    }
+    const size_t evicted =
+        VideoCommon::GraphicsPipelinesToEvict(graphics_cache.size(), candidates.size(), budget);
+    if (evicted == 0) {
+        return;
+    }
+    std::nth_element(candidates.begin(), candidates.begin() + (evicted - 1), candidates.end(),
+                     [](const auto& a, const auto& b) { return a.first < b.first; });
+    const u64 tick = scheduler.CurrentTick();
+    for (size_t i = 0; i < evicted; ++i) {
+        const auto it = graphics_cache.find(candidates[i].second);
+        if (used_this_session.erase(it->second.get()) != 0) {
             used_and_evicted.insert(it->first.Hash());
         }
         evicted_pipelines.emplace_back(tick, std::move(it->second));
-        it = graphics_cache.erase(it);
-        ++evicted;
-    }
-    if (evicted == 0) {
-        return;
+        graphics_cache.erase(it);
     }
     for (auto& [key, pipeline] : graphics_cache) {
         if (pipeline) {
