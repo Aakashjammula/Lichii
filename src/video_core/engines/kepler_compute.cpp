@@ -575,7 +575,12 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
     // colour image and stores none retains its colour and opens a skip window; the pass that
     // stores an image upscaling it is replaced by a plain copy and closes it. The gameplay
     // network is left alone: its pair (+0xc0 -> +0xd0) carries the tonemap.
-    if (!native_upscale_disabled && !dlss_chain.active &&
+    // Experiment (EDEN_NX2_OOT_MOVIE_COPY=0): run the movie network natively.
+    static const bool movie_copy = [] {
+        const char* value = std::getenv("EDEN_NX2_OOT_MOVIE_COPY");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (movie_copy && !native_upscale_disabled && !dlss_chain.active &&
         Settings::GetCurrentProgramID() == VideoCommon::OotNetwork::ProgramId &&
         (launch_description.const_buffer_enable_mask & 1)) {
         const auto& cbuf = launch_description.const_buffer_config[0];
@@ -621,6 +626,16 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
             }
         } else if (!replacement_input && network_skip_remaining > 0) {
             if (--network_skip_remaining == 0) {
+                // The window ran out without the movie's output pass: it skipped 32 dispatches
+                // that were not the movie network.
+                static std::atomic<u32> expired{};
+                if (const u32 count = expired.fetch_add(1, std::memory_order_relaxed);
+                    count < 16 || (count & (count - 1)) == 0) {
+                    LOG_WARNING(HW_GPU,
+                                "Ocarina movie copy: skip window expired without an output pass "
+                                "(last {:#x}, {} times)",
+                                regs.code_loc.Address(), count + 1);
+                }
                 native_upscale_input.reset();
             }
             skipping = true;
