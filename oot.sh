@@ -8,6 +8,10 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+# LICHII_BIN=<path> runs another build with the same settings (e.g. the upstream PGO release:
+#   LICHII_BIN=~/Applications/lichii-pgo-117/lichii-pgo.AppImage ./oot.sh).
+LICHII_BIN="${LICHII_BIN:-./build/bin/lichii}"
+
 export EDEN_NX2_PRELOAD_ALL_PIPELINES=1     # build every cached shader at boot
 export EDEN_NX2_PIPELINE_EVICT_FRAMES=0     # never drop built shaders mid-session
 export EDEN_NX2_FS_READ_MBPS=0              # no artificial 40 MB/s game-file read limit
@@ -36,14 +40,14 @@ pace|pace30)
     export EDEN_NX2_DISPLAY_HZ="${EDEN_NX2_DISPLAY_HZ:-${hz:-60}}"
     echo "host pacer: display ${EDEN_NX2_DISPLAY_HZ} Hz"
     [[ "$1" == pace30 ]] && export EDEN_NX2_SWAP_INTERVAL=2   # low-latency locked 30 FPS
-    exec ./build/bin/lichii
+    exec "$LICHII_BIN"
     ;;
 --perf)
     mkdir -p "$HOME/lichii-perf"
     out="$HOME/lichii-perf/perf-$(date +%Y%m%d-%H%M%S).data"
     echo "perf data: $out"
     # No -g: call-stack sampling fails to open for Lichii; DEBUGINFOD off so exit is quick.
-    DEBUGINFOD_URLS= exec perf record -F 199 -e cpu-clock -o "$out" -- ./build/bin/lichii
+    DEBUGINFOD_URLS= exec perf record -F 199 -e cpu-clock -o "$out" -- "$LICHII_BIN"
     ;;
 esac
-exec ./build/bin/lichii
+exec "$LICHII_BIN"
