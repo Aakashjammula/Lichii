@@ -312,8 +312,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         const auto& cbufs{maxwell3d->state.shader_stages[stage].const_buffers};
         const auto read_handle{[&](const auto& desc, u32 index) {
             if (desc.handle_program != ~0U) {
-                // Read by the shader from a storage buffer: computed for this draw (for an
-                // array, for each element).
+                // Read by the shader from a storage buffer: computed for this draw.
                 return TexturePair(VideoCommon::EvaluateTextureHandle(
                                        info, desc.handle_program, *gpu_memory,
                                        [&](u32 cbuf) -> GPUVAddr {
@@ -321,7 +320,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                                                       ? cbufs[cbuf].address
                                                       : GPUVAddr{};
                                        },
-                                       storage_buffer_alignment, index),
+                                       storage_buffer_alignment),
                                    via_header_index);
             }
             ASSERT(cbufs[desc.cbuf_index].enabled);
