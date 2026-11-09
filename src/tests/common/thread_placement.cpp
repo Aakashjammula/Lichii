@@ -2,6 +2,7 @@
 
 #include <vector>
 #include <catch2/catch_test_macros.hpp>
+#include "common/core_pinning.h"
 #include "common/thread.h"
 
 TEST_CASE("CPU lists parse ranges and singles", "[common][thread]") {

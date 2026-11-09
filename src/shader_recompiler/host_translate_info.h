@@ -7,6 +7,7 @@
 #pragma once
 
 #include <cstdlib>
+#include <initializer_list>
 
 #include "common/common_types.h"
 
@@ -48,6 +49,25 @@ struct HostTranslateInfo {
     /// buffer instead of picking among every bound buffer at run time
     /// (EDEN_NX2_COMPACT_GLOBAL_LOADS, see CompactGlobalLoadsRequested)
     bool compact_global_loads{};
+
+    /// The properties that change which values translation reads from the environment, a bit
+    /// each: those deciding a pass that reads values, or a pass that changes the program before
+    /// one does. A disk cache record made where they differ can lack a value read here and still
+    /// hold every value read there. The descriptor limits decide which storage buffer passes run,
+    /// but each of those asks what the first one asked. A property that starts deciding such a pass
+    /// is added at the end, so that the bits of the others stay.
+    [[nodiscard]] u32 EnvironmentReadProperties() const noexcept {
+        u32 properties{};
+        u32 bit{1};
+        for (const bool property :
+             {support_float64, support_float16, support_int64, support_conditional_barrier,
+              needs_demote_reorder, support_geometry_shader_passthrough, support_viewport_mask,
+              single_lane_geometry_subgroups, support_snorm_render_buffer}) {
+            properties |= property ? bit : 0U;
+            bit <<= 1;
+        }
+        return properties;
+    }
 
     void ApplyDescriptorLimitPolicy() noexcept {
         if (min_ssbo_alignment == 0) {

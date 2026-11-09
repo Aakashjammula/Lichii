@@ -634,8 +634,25 @@ void SelectCurrentThreadCpuSets(const std::vector<ULONG>& ids) {
 #include <optional>
 
 namespace {
+// The CPUs of a sysfs CPU list file; empty when the file is missing.
+cpu_set_t ReadCpuList(const char* path) {
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    std::ifstream file{path};
+    std::string list;
+    if (!(file >> list)) {
+        return set;
+    }
+    for (const u32 cpu : Common::ParseCpuList(list)) {
+        if (cpu < CPU_SETSIZE) {
+            CPU_SET(static_cast<int>(cpu), &set);
+        }
+    }
+    return set;
+}
+
 // The logical processors this process may run on, with their physical core (package and core id)
-// and, on hybrid CPUs that report it, their relative capacity as the efficiency class.
+// and, on hybrid CPUs, their relative capacity as the efficiency class.
 std::vector<Common::LogicalProcessor> LinuxProcessors() {
     std::vector<Common::LogicalProcessor> processors;
     cpu_set_t allowed;
@@ -643,6 +660,10 @@ std::vector<Common::LogicalProcessor> LinuxProcessors() {
     if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0) {
         return processors;
     }
+    // Intel hybrid CPUs list their efficiency cores here (the cpu_atom PMU), also on kernels
+    // that don't report cpu_capacity on x86. Without it, all cores rank equal and a CPU with
+    // fewer than MinCoresForGpuThreadPinning performance cores would pass the check.
+    const cpu_set_t efficiency = ReadCpuList("/sys/devices/cpu_atom/cpus");
     const auto read = [](int cpu, const char* node) -> std::optional<u32> {
         std::ifstream file{"/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/" + node};
         u32 value{};
@@ -660,8 +681,10 @@ std::vector<Common::LogicalProcessor> LinuxProcessors() {
         if (!core || !package) {
             return {};
         }
-        // cpu_capacity is 1024 for the fastest cores; absent on CPUs that are not hybrid.
-        const u32 capacity = read(cpu, "cpu_capacity").value_or(1024);
+        // cpu_capacity is 1024 for the fastest cores; absent on CPUs that are not hybrid, and
+        // often on x86 ones that are.
+        const u32 capacity =
+            read(cpu, "cpu_capacity").value_or(CPU_ISSET(cpu, &efficiency) ? 512U : 1024U);
         processors.push_back({static_cast<u32>(cpu), (*package << 16) | *core,
                               static_cast<u8>((std::min)(capacity, 1024U) >> 3)});
     }
@@ -682,51 +705,6 @@ void SetCurrentThreadAffinity(const std::vector<u32>& cpus) {
 #endif
 
 namespace Common {
-
-std::vector<u32> ParseCpuList(std::string_view list) {
-    std::vector<u32> cpus;
-    while (!list.empty() && (list.back() == '\n' || list.back() == ' ')) {
-        list.remove_suffix(1);
-    }
-    const auto parse_number = [&list](u32& out) {
-        size_t length = 0;
-        u32 value = 0;
-        while (length < list.size() && list[length] >= '0' && list[length] <= '9' &&
-               length < 5) {
-            value = value * 10 + static_cast<u32>(list[length] - '0');
-            ++length;
-        }
-        list.remove_prefix(length);
-        out = value;
-        return length > 0;
-    };
-    while (!list.empty()) {
-        u32 first = 0;
-        if (!parse_number(first)) {
-            return {};
-        }
-        u32 last = first;
-        if (!list.empty() && list.front() == '-') {
-            list.remove_prefix(1);
-            if (!parse_number(last) || last < first) {
-                return {};
-            }
-        }
-        for (u32 cpu = first; cpu <= last; ++cpu) {
-            cpus.push_back(cpu);
-        }
-        if (!list.empty()) {
-            if (list.front() != ',') {
-                return {};
-            }
-            list.remove_prefix(1);
-            if (list.empty()) {
-                return {};
-            }
-        }
-    }
-    return cpus;
-}
 
 void SetCurrentThreadPriority(ThreadPriority new_priority) {
 #ifdef _WIN32

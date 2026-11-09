@@ -125,7 +125,4 @@ void PinCurrentThread(PinnedRole role);
 void RefreshThreadPolicies();
 void PollThreadPolicies();
 
-/// Parses a Linux CPU list such as "0-11" or "12-19,24"; returns an empty list if malformed.
-std::vector<u32> ParseCpuList(std::string_view list);
-
 } // namespace Common

@@ -868,7 +868,7 @@ TEST_CASE("Fast-drain macro reads wait for overlapping, aliased and unranged wri
 
     // Neither a draw nor work deferred as not writing memory counts.
     split.Method(&f.fast, DrawEnd, 0, true, nullptr);
-    split.Defer([] {}, false);
+    split.Defer([] {}, 0, false);
     REQUIRE_FALSE(queued(gpu_address, 4));
 
     const std::array<u32, 4> words{1, 2, 3, 4};
@@ -1068,7 +1068,7 @@ TEST_CASE("Front report reads see what a draw before a wait-for-idle wrote",
                     Tegra::Nx2MarkGpuWritten(ReportMemory::device_address, 4);
                 }
             },
-            false);
+            0, false);
         split.Method(&f.fast, MAXWELL3D_REG_INDEX(wait_for_idle), 0, true, nullptr);
     };
     draw(0x55, false);
