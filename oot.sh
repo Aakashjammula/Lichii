@@ -3,6 +3,7 @@
 #   ./oot.sh          play (proven settings)
 #   ./oot.sh new      proven settings + the newer opt-in optimizations
 #   ./oot.sh pace     proven settings + Frizti display-locked frame pacing (60 FPS)
+#   ./oot.sh smooth   display-locked pacing without async discard (no pop-in)
 #   ./oot.sh pace30   same, locked low-latency 30 FPS
 #   ./oot.sh --perf   proven settings while perf samples the CPU (data in ~/lichii-perf/)
 #   ./oot.sh upstream only switches upstream build 117 also has (none of this branch's)
@@ -12,6 +13,15 @@ cd "$(dirname "$0")"
 # LICHII_BIN=<path> runs another build with the same settings (e.g. the upstream PGO release:
 #   LICHII_BIN=~/Applications/lichii-pgo-117/lichii-pgo.AppImage ./oot.sh).
 LICHII_BIN="${LICHII_BIN:-./build/bin/lichii}"
+
+# The emulator is CPU-bound: on this laptop "balanced" holds the P-cores near 1.2 GHz, while
+# "performance" lets them reach 4.1 GHz. Do not change it here; just say what is active.
+if command -v powerprofilesctl >/dev/null 2>&1; then
+    profile="$(powerprofilesctl get 2>/dev/null || true)"
+    if [[ -n "$profile" && "$profile" != performance ]]; then
+        echo "note: power profile is '$profile'; CPU stays near 1.2 GHz. Run: powerprofilesctl set performance"
+    fi
+fi
 
 if [[ "${1:-}" == upstream ]]; then
     # Compares this branch with upstream: no EDEN_NX2_FS_READ_MBPS, FAST_DRAIN,
@@ -44,6 +54,17 @@ new)
     export EDEN_NX2_OCCLUSION_READ_WAIT=1   # targeted lighting fix (zortos #267's approach, not #215)
     export EDEN_NX2_FRONT_REPORT_READS=1    # answer macro report reads on the front (zortos #243 idea)
     export EDEN_NX2_UNSAFE_TIC_READ=1       # no flushing descriptor read during shader translation (Zeus)
+    ;;
+smooth)
+    # Display-locked pacing without ASYNC_DISCARD: at 60 fps on a 180 Hz panel every frame lands
+    # on the third refresh instead of alternating three and four, so the image is steady and
+    # nothing is skipped. OCCLUSION_READ_WAIT fixes the flickering rocks.
+    export EDEN_NX2_HOST_PACE=1
+    export EDEN_NX2_OCCLUSION_READ_WAIT=1
+    hz=$(xrandr --current 2>/dev/null | awk '/\*/{for(i=2;i<=NF;i++) if($i ~ /\*/){gsub(/[*+]/,"",$i); print $i; exit}}')
+    export EDEN_NX2_DISPLAY_HZ="${EDEN_NX2_DISPLAY_HZ:-${hz:-60}}"
+    echo "host pacer: display ${EDEN_NX2_DISPLAY_HZ} Hz (no async discard)"
+    exec "$LICHII_BIN"
     ;;
 pace|pace30)
     # Frizti display-locked frame pacer (off unless EDEN_NX2_HOST_PACE=1).

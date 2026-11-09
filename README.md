@@ -54,6 +54,7 @@ cmake --build build --parallel 6   # 6 jobs: more can run a 16 GB machine out of
 | `EDEN_NX2_COMPACT_GLOBAL_LOADS=1 ./oot.sh` | **Recommended.** Tuned settings plus faster-compiling shaders |
 | `./oot.sh` | Tuned settings |
 | `./oot.sh upstream` | Only switches upstream also has, to compare this branch with upstream |
+| `./oot.sh smooth` | Display-locked 60 fps on a high-refresh display, without async shader discard (no pop-in) |
 | `./oot.sh pace` / `pace30` | Optional: display-locked frame pacing at 60 or 30 fps (adds async shader discard, so new objects can pop in) |
 | `./oot.sh --perf` | Tuned settings with `perf` CPU sampling (output in `~/lichii-perf/`) |
 
@@ -64,6 +65,7 @@ Recommended emulator settings (Emulation → Configure → Graphics):
 - **Ocarina of Time anti-aliasing: No sharpening.** Skips the game's sharpening network, which is faster and removes edge halos. It does nothing while NVIDIA DLSS is on.
 - **NVIDIA DLSS off.** It leaves white streaks at night.
 - **GPU mode Fast**, **asynchronous shaders** and **asynchronous presentation** on. Accurate turns off the split GPU thread.
+- **Power profile `performance`** (`powerprofilesctl set performance`). On `balanced` the laptop holds the CPU near 1.2 GHz; `performance` lets it reach 4.1 GHz, which the CPU-bound emulator needs. It returns to `power-saver` on battery automatically.
 - **Graphics → Extras → "Pin GPU threads to their own cores"** on hybrid Intel CPUs.
 - Add-ons **Max Resolution** and **Dynamic FPS** on (both built in and on by default).
 
